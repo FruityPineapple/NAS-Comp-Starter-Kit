@@ -131,7 +131,8 @@ def fail_dataset(metadata):
     with open("predictions/{}_stats.pkl".format(metadata['codename']), "wb") as f:
         pkl.dump(run_data, f)
 
-def is_out_of_time(clock:Clock, metadata, grace_time:bool=False):
+# FIX: grace_time now has an explicit default so calls with 2 or 3 args both work
+def is_out_of_time(clock: Clock, metadata, grace_time: bool = False):
     if clock.check() < 0:
         if grace_time:
             if clock.check() > -60:
@@ -141,7 +142,7 @@ def is_out_of_time(clock:Clock, metadata, grace_time:bool=False):
         return True
     return False
 
-def run_submission(runclock:Clock, dataset:str):
+def run_submission(runclock: Clock, dataset: str):
         IMUT_CLOCK = copy.deepcopy(runclock)
         # load and display data info
         (train_x, train_y), (valid_x, valid_y), (test_x), metadata = load_datasets(dataset, truncate=False)
@@ -155,6 +156,7 @@ def run_submission(runclock:Clock, dataset:str):
         # perform data processing/augmentation/etc using your DataProcessor
         print("\n=== Processing Data ===")
         print("  Allotted compute time remaining: ~{}".format(show_time(IMUT_CLOCK.check())))
+        # FIX: always pass grace_time explicitly (False here, True only at final check)
         if is_out_of_time(IMUT_CLOCK, metadata, False):
             return
         data_processor = DataProcessor(train_x, train_y, valid_x, valid_y, test_x, metadata, runclock)

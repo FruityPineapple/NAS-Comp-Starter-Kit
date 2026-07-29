@@ -1,16 +1,16 @@
 # NAS Unseen-Data Challenge 2026: Project Proposal
 
 ## 1. Research Question
-**"How can we effectively adapt Neural Architecture Search to unseen datasets with unknown, strict time constraints by leveraging Zero-Cost Proxies (ZCPs), hybrid evaluation, and time-aware advanced ensembling?"**
+**"How can I effectively adapt Neural Architecture Search to unseen datasets with unknown, strict time constraints by leveraging Zero-Cost Proxies (ZCPs), hybrid evaluation, and time-aware advanced ensembling?"**
 
-Because the competition involves entirely novel datasets and an unknown runtime limit, traditional NAS approaches that rely on full or partial training for performance estimation are too slow and risky. We propose to evaluate whether a hybrid approach—using Zero-Cost Proxies (ZCPs) for rapid initial filtering followed by short learning curve extrapolation—can reliably identify high-performing architectures on unseen data domains. Furthermore, we investigate if advanced ensembling techniques (such as Greedy Ensemble Selection or CMA-ES weight optimization) applied to the top architectures can significantly improve generalization and robustness when time permits.
+Because the competition involves entirely novel datasets and an unknown runtime limit, traditional NAS approaches that rely on full or partial training for performance estimation are too slow and risky. I propose to evaluate whether a hybrid approach—using Zero-Cost Proxies (ZCPs) for rapid initial filtering followed by short learning curve extrapolation—can reliably identify high-performing architectures on unseen data domains. Furthermore, I investigate if advanced ensembling techniques (such as Greedy Ensemble Selection or CMA-ES weight optimization) applied to the top architectures can significantly improve generalization and robustness when time permits.
 
 ## 2. Required Steps
 
 1. **DataProcessor Construction:** 
    Implement dynamic PyTorch dataloaders that read the dataset's metadata. The processor will automatically adjust batch sizes and apply generalized robust augmentations (like RandAugment) to handle varying domains, ensuring strong regularization without overfitting.
 2. **Search Space Definition:** 
-   Adopt a compact, cell-based search space (similar to DARTS or NASNet). A cell-based approach transfers well across different datasets and keeps the macro-architecture complexity manageable.
+   Adopt a compact, cell-based search space (DARTS, NASnet). A cell-based approach transfers well across different datasets and keeps the macro-architecture complexity manageable. Maybe im going to use NASLib or other Libs but I have to check if that is allowed.
 3. **Hybrid ZCP-Guided Search Strategy:** 
    Implement a Random Search or Evolutionary algorithm that uses Zero-Cost Proxies (e.g., `synflow`, `jacob_cov`) for initial performance estimation. This allows evaluating thousands of candidate architectures in just a few minutes. To mitigate the risk of ZCPs correlating poorly with specific novel datasets, we will aggressively filter down to the top 50 architectures, then use learning curve extrapolation (training for 1-2 epochs) to select the final top candidates.
 4. **Fast Hyperparameter Optimization (HPO):**
@@ -22,6 +22,6 @@ Because the competition involves entirely novel datasets and an unknown runtime 
 
 ## 3. Evaluation Strategy
 
-- **Baseline Comparison:** We will compare our hybrid ZCP + advanced ensembling approach against a standard Random Search baseline that relies purely on learning curve extrapolation, to verify which method yields better architectures within strict time limits.
-- **Dataset Diversity Testing:** We will test our pipeline locally on the diverse historical datasets provided in the starter kit (AddNIST, Gutenberg, CIFARTile, GeoClassing, Sudoku, etc.) to ensure our `DataProcessor` and NAS strategy generalize across drastically different data modalities.
-- **Time Constraint Stress Testing:** Using the provided `Makefile` (`make submission=$SUBMISSION_DIRECTORY all`), we will run extensive local evaluations with varying `time_limit` variables in the dataset metadata (e.g., 5 minutes, 30 minutes, 2 hours). We will measure the successful completion rate to ensure the time-aware trainer never crashes or exceeds the limit.
+- **Baseline Comparison:** I will compare my hybrid ZCP + advanced ensembling approach against a standard Random Search baseline that relies purely on learning curve extrapolation, to verify which method yields better architectures within strict time limits.
+- **Dataset Diversity Testing:** I will test my pipeline locally on the diverse historical datasets provided in the starter kit (AddNIST, Gutenberg, CIFARTile, GeoClassing, Sudoku, etc.) to ensure my `DataProcessor` and NAS strategy generalize across drastically different data modalities.
+- **Time Constraint Stress Testing:** Using the provided `Makefile` (`make submission=$SUBMISSION_DIRECTORY all`), I will run extensive local evaluations with varying `time_limit` variables in the dataset metadata (e.g., 5 minutes, 30 minutes, 2 hours). I will measure the successful completion rate to ensure the time-aware trainer never crashes or exceeds the limit.

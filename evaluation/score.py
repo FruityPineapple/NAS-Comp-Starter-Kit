@@ -60,7 +60,7 @@ if __name__ == '__main__':
 
         print("===========================")
         print("Final Score: {:.3f}".format(total_score))
-        overall_stats['Final_Score'] = np.round(total_score, 3)
+        overall_stats['Final_Score'] = float(np.round(total_score, 3))
         with open("final_results.json", "w") as f:
             json.dump(overall_stats, f)
     except Exception as e:
