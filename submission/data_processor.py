@@ -1,180 +1,123 @@
-"""
-data_processor.py — Adaptive DataProcessor for the NAS Unseen-Data Challenge 2026.
+"""Adaptive and memory-conscious data processing for unseen image datasets."""
 
-Handles arbitrary input domains by:
-  - Auto-detecting and fixing missing channel dimensions (3D → 4D)
-  - Computing per-channel normalization statistics from training data
-  - Applying data-adaptive augmentation (skip spatial transforms for tiny inputs,
-    skip color transforms for grayscale, etc.)
-  - Dynamically selecting batch size based on input tensor size
-  - Enriching metadata with data properties for downstream NAS and Trainer use
-"""
+import random
 
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
 import numpy as np
+import torch
+import torchvision.transforms as transforms
 
 from helpers import estimate_batch_size, inspect_data_properties, show_time
 
 
-# =============================================================================
-# Dataset wrapper
-# =============================================================================
+def _seed_worker(worker_id):
+    """Make torchvision/Python augmentation deterministic in loader workers."""
+    worker_seed = (torch.initial_seed() + worker_id) % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 class NASDataset(torch.utils.data.Dataset):
-    """
-    PyTorch Dataset that wraps numpy arrays with optional per-sample transforms.
-
-    Handles:
-      - 3D arrays (missing channel dim) → reshaped to 4D
-      - Float32 conversion for stable training
-      - Optional label tensor (None for test set)
-      - Lazy transform application (per-sample, not precomputed)
-    """
-
     def __init__(self, x, y=None, transform=None):
-        # Convert to float32 tensor
-        self.x = torch.tensor(x, dtype=torch.float32)
-
-        # Fix missing channel dimension: [N, H, W] → [N, 1, H, W]
+        # Avoid a second full copy when the competition arrays are already
+        # contiguous float32.
+        self.x = torch.from_numpy(np.ascontiguousarray(x))
+        if self.x.dtype != torch.float32:
+            self.x = self.x.float()
         if self.x.ndim == 3:
             self.x = self.x.unsqueeze(1)
 
-        # Labels (None for test split)
-        if y is not None:
-            self.y = torch.tensor(y, dtype=torch.long)
-        else:
-            self.y = None
-
+        self.y = (
+            torch.as_tensor(np.ascontiguousarray(y), dtype=torch.long)
+            if y is not None
+            else None
+        )
         self.transform = transform
 
     def __len__(self):
         return len(self.x)
 
-    def __getitem__(self, idx):
-        img = self.x[idx]
-
+    def __getitem__(self, index):
+        image = self.x[index]
         if self.transform is not None:
-            img = self.transform(img)
-
+            image = self.transform(image)
         if self.y is None:
-            return img
-        return img, self.y[idx]
-
-
-# =============================================================================
-# Augmentation builder
-# =============================================================================
-
-class Cutout:
-    """
-    Randomly masks out a square patch of the image.
-
-    Simple but effective regularization for image classification.
-    Works on tensor inputs [C, H, W].
-    """
-
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img):
-        c, h, w = img.shape
-        mask = torch.ones(c, h, w, dtype=img.dtype)
-
-        # Random center for the cutout patch
-        cy = torch.randint(0, h, (1,)).item()
-        cx = torch.randint(0, w, (1,)).item()
-
-        y1 = max(0, cy - self.size // 2)
-        y2 = min(h, cy + self.size // 2)
-        x1 = max(0, cx - self.size // 2)
-        x2 = min(w, cx + self.size // 2)
-
-        mask[:, y1:y2, x1:x2] = 0.0
-        return img * mask
+            return image
+        return image, self.y[index]
 
 
 def build_augmentation_pipeline(data_props, mean, std):
     """
-    Build a data-adaptive augmentation pipeline based on inspected data properties.
+    Choose conservative transforms from scale-aware data fingerprints.
 
-    Strategy:
-      - ALWAYS: normalize with training mean/std
-      - Small inputs (<=8×8): normalize only — spatial transforms destroy structure
-      - Medium inputs (9-32): mild augmentation (flip, small pad+crop)
-      - Large inputs (>32): stronger augmentation (flip, crop, cutout)
-      - Grayscale: skip color-based transforms
+    Unknown datasets make aggressive generic augmentation risky.  Structured
+    and standardized inputs therefore never receive flips or rotations.
     """
-    h = data_props['height']
-    w = data_props['width']
-    is_small = data_props['is_small']
-    is_grayscale = data_props['is_grayscale']
-
+    height = data_props["height"]
+    width = data_props["width"]
+    min_dim = min(height, width)
     normalize = transforms.Normalize(mean, std)
 
-    # ----- Small spatial resolution (<=8): normalize only -----
-    if is_small:
-        train_transform = transforms.Compose([normalize])
-        eval_transform = transforms.Compose([normalize])
-        return train_transform, eval_transform
+    if data_props["is_small"]:
+        pipeline = transforms.Compose([normalize])
+        return pipeline, pipeline
 
-    # ----- Medium spatial resolution (9-32) -----
-    train_augmentations = []
-    min_dim = min(h, w)
+    is_grayscale = data_props["is_grayscale"]
+    is_structured = data_props.get("is_structured", is_grayscale)
+    low_variance_color = data_props.get("low_variance_color", False)
+    horizontal_flip_safe = data_props.get(
+        "horizontal_flip_safe", not is_structured
+    )
+    vertical_flip_safe = data_props.get("vertical_flip_safe", False)
+    augmentations = []
 
-    # Skip horizontal flip for low-variance grayscale data (likely digits/symbols/structured)
-    is_structured = data_props.get('is_grayscale', False) and data_props.get('spatial_variance', 1.0) < 0.15
-    if min_dim >= 12 and not is_structured:
-        # Horizontal flip — safe for most natural-ish data
-        train_augmentations.append(transforms.RandomHorizontalFlip(p=0.5))
-    elif is_structured:
-        print("  [DataProcessor] Skipping horizontal flip (low-variance grayscale — likely structured data)")
+    if min_dim >= 12 and horizontal_flip_safe:
+        augmentations.append(transforms.RandomHorizontalFlip(p=0.5))
+    if min_dim >= 12 and vertical_flip_safe and data_props["is_square"]:
+        augmentations.append(transforms.RandomVerticalFlip(p=0.5))
+    if not horizontal_flip_safe and not vertical_flip_safe:
+        print("  [DataProcessor] Skipping flips (structured/synthetic data)")
 
     if min_dim >= 16:
-        # Random crop with padding — mild spatial jitter
-        pad = max(2, min_dim // 8)
-        train_augmentations.append(transforms.RandomCrop((h, w), padding=pad))
+        if is_grayscale and is_structured:
+            # Mild translation helps glyphs. Rotations/reflections can change
+            # their label and are deliberately avoided.
+            augmentations.append(
+                transforms.RandomAffine(degrees=0, translate=(0.06, 0.06))
+            )
+        else:
+            pad = max(2, min_dim // 16)
+            augmentations.append(
+                transforms.RandomCrop((height, width), padding=pad)
+            )
 
-    # ----- Large spatial resolution (>32): add cutout -----
-    if min_dim > 32:
-        cutout_size = max(4, min_dim // 4)
-        train_augmentations.append(Cutout(cutout_size))
+    augmentations.append(normalize)
 
-    # Always normalize at the end
-    train_augmentations.append(normalize)
+    # RandomErasing is reserved for natural-looking large images.  After
+    # normalization, an erased value of zero is the channel mean.
+    if min_dim > 32 and not is_structured and not low_variance_color:
+        augmentations.append(
+            transforms.RandomErasing(
+                p=0.20,
+                scale=(0.02, 0.10),
+                ratio=(0.5, 2.0),
+                value=0,
+            )
+        )
 
-    train_transform = transforms.Compose(train_augmentations)
-    eval_transform = transforms.Compose([normalize])
+    return transforms.Compose(augmentations), transforms.Compose([normalize])
 
-    return train_transform, eval_transform
-
-
-# =============================================================================
-# DataProcessor
-# =============================================================================
 
 class DataProcessor:
-    """
-    ====================================================================================================================
-    INIT ===============================================================================================================
-    ====================================================================================================================
-    The DataProcessor class will receive the following inputs:
-        * train_x: numpy array of shape [n_train_datapoints, channels, height, width], these are the training inputs
-        * train_y: numpy array of shape [n_train_datapoints], these are the training labels
-        * valid_x: numpy array of shape [n_valid_datapoints, channels, height, width], these are the validation inputs
-        * valid_y: numpy array of shape [n_valid_datapoints], these are the validation labels
-        * test_x: numpy array of shape [n_valid_datapoints, channels, height, width], these are the test inputs
-        * metadata: A dictionary with information about this dataset, with the following keys:
-            'num_classes' : The number of output classes in the classification problem
-            'codename' : A unique string that represents this dataset
-            'input_shape': A tuple describing [n_total_datapoints, channel, height, width] of the input data
-            'time_remaining': The amount of compute time left for your submission
-
-    You can modify or add anything into the metadata that you wish, if you want to pass messages between your classes.
-    """
-
-    def __init__(self, train_x, train_y, valid_x, valid_y, test_x, metadata, clock):
+    def __init__(
+        self,
+        train_x,
+        train_y,
+        valid_x,
+        valid_y,
+        test_x,
+        metadata,
+        clock,
+    ):
         self.train_x = train_x
         self.train_y = train_y
         self.valid_x = valid_x
@@ -183,136 +126,242 @@ class DataProcessor:
         self.metadata = metadata
         self.clock = clock
 
-    """
-    ====================================================================================================================
-    PROCESS ============================================================================================================
-    ====================================================================================================================
-    This function will be called, and it expects you to return three outputs:
-        * train_loader: A Pytorch dataloader of (input, label) tuples
-        * valid_loader: A Pytorch dataloader of (input, label) tuples
-        * test_loader: A Pytorch dataloader of (inputs)  <- Make sure shuffle=False and drop_last=False!
-
-    See https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader for more info.
-
-    Here, you can do whatever you want to the input data to process it for your NAS algorithm and training functions
-    """
-
     def process(self):
         print("  [DataProcessor] Analyzing data properties...")
-
-        # ---- Step 1: Inspect raw data ----
         data_props = inspect_data_properties(self.train_x)
+        horizontal_safe, vertical_safe = self._estimate_flip_safety(data_props)
+        data_props["horizontal_flip_safe"] = horizontal_safe
+        data_props["vertical_flip_safe"] = vertical_safe
+
+        class_counts = np.bincount(
+            np.asarray(self.train_y, dtype=np.int64),
+            minlength=int(self.metadata["num_classes"]),
+        )
+        nonzero_counts = class_counts[class_counts > 0]
+        data_props["class_imbalance_ratio"] = (
+            float(nonzero_counts.max() / max(1.0, nonzero_counts.mean()))
+            if len(nonzero_counts)
+            else 1.0
+        )
         self._log_data_props(data_props)
+        self.metadata["data_props"] = data_props
 
-        # Enrich metadata so NAS and Trainer can use these properties
-        self.metadata['data_props'] = data_props
+        # Historical metadata can contain nominal dimensions (for example
+        # 64x64 before a 60x60 preprocessing crop).  Models must use the actual
+        # tensors.
+        original_shape = self.metadata.get("input_shape", [len(self.train_x)])
+        total_samples = int(original_shape[0])
+        self.metadata["input_shape"] = [
+            total_samples,
+            data_props["channels"],
+            data_props["height"],
+            data_props["width"],
+        ]
+        print(
+            "  [DataProcessor] Effective input_shape: {}".format(
+                self.metadata["input_shape"]
+            )
+        )
 
-        # Fix the input_shape in metadata if channels were missing
-        if len(self.train_x.shape) == 3:
-            n, h, w = self.train_x.shape
-            self.metadata['input_shape'] = [n, 1, h, w]
-            print("  [DataProcessor] Fixed input_shape (added channel dim): {}".format(
-                self.metadata['input_shape']))
-
-        # ---- Step 2: Compute normalization statistics from training data ----
         mean, std = self._compute_normalization_stats()
-        print("  [DataProcessor] Normalization — mean: {}, std: {}".format(
-            [round(m, 4) for m in mean],
-            [round(s, 4) for s in std]))
+        print(
+            "  [DataProcessor] Normalization — mean: {}, std: {}".format(
+                [round(value, 4) for value in mean],
+                [round(value, 4) for value in std],
+            )
+        )
 
-        # ---- Step 3: Build data-adaptive augmentation pipelines ----
         train_transform, eval_transform = build_augmentation_pipeline(
             data_props, mean, std
         )
         print("  [DataProcessor] Train augmentations: {}".format(train_transform))
 
-        # ---- Step 4: Create PyTorch datasets ----
-        train_ds = NASDataset(self.train_x, self.train_y, transform=train_transform)
-        valid_ds = NASDataset(self.valid_x, self.valid_y, transform=eval_transform)
-        test_ds  = NASDataset(self.test_x,  None,         transform=eval_transform)
+        train_dataset = NASDataset(
+            self.train_x, self.train_y, transform=train_transform
+        )
+        valid_dataset = NASDataset(
+            self.valid_x, self.valid_y, transform=eval_transform
+        )
+        test_dataset = NASDataset(self.test_x, None, transform=eval_transform)
 
-        # ---- Step 5: Select batch size ----
-        batch_size = estimate_batch_size(self.metadata['input_shape'])
+        batch_size = estimate_batch_size(self.metadata["input_shape"])
+        self.metadata["batch_size"] = batch_size
         print("  [DataProcessor] Batch size selected: {}".format(batch_size))
 
-        # Store for downstream use
-        self.metadata['batch_size'] = batch_size
-
-        # ---- Step 6: Build dataloaders ----
-        # Use num_workers=0 for maximum compatibility across server environments
-        # (avoids multiprocessing issues on some setups)
-        num_workers = 0
+        cuda = torch.cuda.is_available()
+        num_workers = 2 if cuda else 0
+        generator = torch.Generator()
+        generator.manual_seed(1729)
+        common = {
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": cuda,
+            "worker_init_fn": _seed_worker if num_workers else None,
+            "persistent_workers": bool(num_workers),
+        }
 
         train_loader = torch.utils.data.DataLoader(
-            train_ds,
-            batch_size=batch_size,
+            train_dataset,
             shuffle=True,
-            drop_last=(len(train_ds) > batch_size),  # avoid empty loader
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
+            drop_last=len(train_dataset) > batch_size,
+            generator=generator,
+            **common
         )
-
         valid_loader = torch.utils.data.DataLoader(
-            valid_ds,
-            batch_size=batch_size,
+            valid_dataset,
             shuffle=False,
             drop_last=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
+            **common
         )
-
-        # CRITICAL: test_loader must NOT shuffle and must NOT drop_last
-        # (main.py asserts this — violation = instant crash)
         test_loader = torch.utils.data.DataLoader(
-            test_ds,
-            batch_size=batch_size,
+            test_dataset,
             shuffle=False,
             drop_last=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
+            **common
         )
 
-        print("  [DataProcessor] Complete. Time remaining: ~{}".format(
-            show_time(self.clock.check())))
-
+        print(
+            "  [DataProcessor] Complete. Time remaining: ~{}".format(
+                show_time(self.clock.check())
+            )
+        )
         return train_loader, valid_loader, test_loader
 
-    # ---- Private helpers ----
-
     def _compute_normalization_stats(self):
-        """
-        Compute per-channel mean and std from training data.
+        raw = self.train_x
+        if raw.shape[0] > 10000:
+            # Deterministic subsampling avoids a float32 copy of the entire
+            # training set.
+            indices = np.linspace(0, raw.shape[0] - 1, 10000, dtype=np.int64)
+            raw = raw[indices]
+        values = np.asarray(raw, dtype=np.float32)
+        if values.ndim == 3:
+            values = values[:, np.newaxis, :, :]
 
-        Uses a subsample for speed on very large datasets.
-        Returns (mean_per_channel, std_per_channel) as lists of floats.
-        """
-        x = self.train_x.astype(np.float32)
-
-        # Handle 3D arrays (missing channel dim)
-        if x.ndim == 3:
-            x = x[:, np.newaxis, :, :]
-
-        # Subsample if dataset is very large (>10k samples)
-        if x.shape[0] > 10000:
-            indices = np.random.choice(x.shape[0], 10000, replace=False)
-            x = x[indices]
-
-        # per-channel mean/std across (N, H, W)
-        mean = np.mean(x, axis=(0, 2, 3))
-        std  = np.std(x, axis=(0, 2, 3))
-
-        # Avoid division by zero — clamp std to a small positive value
-        std = np.maximum(std, 1e-6)
-
+        mean = np.mean(values, axis=(0, 2, 3))
+        std = np.maximum(np.std(values, axis=(0, 2, 3)), 1e-6)
         return mean.tolist(), std.tolist()
 
+    def _estimate_flip_safety(self, data_props):
+        """
+        Cheap label-aware invariance probe using held-out nearest centroids.
+
+        It avoids assuming that all RGB data is natural imagery: mirrored
+        digits/text score substantially worse, while orientation-invariant
+        aerial imagery tends to retain its class-centroid assignment.
+        """
+        if data_props["is_grayscale"] or min(
+            data_props["height"], data_props["width"]
+        ) < 12:
+            return False, False
+
+        sample_count = min(len(self.train_x), 768)
+        if sample_count < max(32, 2 * int(self.metadata["num_classes"])):
+            return (not data_props.get("is_structured", False)), False
+
+        indices = np.linspace(
+            0, len(self.train_x) - 1, sample_count, dtype=np.int64
+        )
+        images = np.asarray(self.train_x[indices], dtype=np.float32)
+        labels = np.asarray(self.train_y, dtype=np.int64)[indices]
+        if images.ndim == 3:
+            images = images[:, np.newaxis, :, :]
+
+        reference_mask = np.arange(sample_count) % 2 == 0
+        evaluation_mask = ~reference_mask
+        reference_images = images[reference_mask]
+        reference_labels = labels[reference_mask]
+        evaluation_images = images[evaluation_mask]
+        evaluation_labels = labels[evaluation_mask]
+
+        stride_h = max(1, data_props["height"] // 16)
+        stride_w = max(1, data_props["width"] // 16)
+
+        def features(batch):
+            reduced = batch[:, :, ::stride_h, ::stride_w]
+            return reduced.reshape(reduced.shape[0], -1).astype(np.float32)
+
+        reference_features = features(reference_images)
+        feature_mean = reference_features.mean(axis=0, keepdims=True)
+        feature_std = np.maximum(
+            reference_features.std(axis=0, keepdims=True), 1e-3
+        )
+        reference_features = (reference_features - feature_mean) / feature_std
+
+        present_classes = np.unique(reference_labels)
+        if len(present_classes) < 2:
+            return False, False
+        centroids = np.stack(
+            [
+                reference_features[reference_labels == class_id].mean(axis=0)
+                for class_id in present_classes
+            ],
+            axis=0,
+        )
+
+        def centroid_accuracy(batch):
+            values = (features(batch) - feature_mean) / feature_std
+            distances = (
+                np.sum(values * values, axis=1, keepdims=True)
+                + np.sum(centroids * centroids, axis=1)[np.newaxis, :]
+                - 2.0 * values.dot(centroids.T)
+            )
+            predictions = present_classes[np.argmin(distances, axis=1)]
+            return float(np.mean(predictions == evaluation_labels))
+
+        base_accuracy = centroid_accuracy(evaluation_images)
+        random_accuracy = 1.0 / max(2, len(present_classes))
+        if base_accuracy < max(0.10, 1.5 * random_accuracy):
+            return (not data_props.get("is_structured", False)), False
+
+        horizontal_accuracy = centroid_accuracy(
+            np.flip(evaluation_images, axis=3)
+        )
+        vertical_accuracy = centroid_accuracy(np.flip(evaluation_images, axis=2))
+        threshold = max(1.5 * random_accuracy, 0.90 * base_accuracy)
+        horizontal_safe = horizontal_accuracy >= threshold
+        vertical_safe = (
+            data_props["is_square"]
+            and data_props.get("low_variance_color", False)
+            and vertical_accuracy >= threshold
+        )
+        return bool(horizontal_safe), bool(vertical_safe)
+
     def _log_data_props(self, props):
-        """Print a summary of detected data properties."""
         print("  [DataProcessor] Data properties:")
-        print("    - Resolution: {}×{}, Channels: {}".format(
-            props['height'], props['width'], props['channels']))
-        print("    - Grayscale: {}, Small: {}, Square: {}".format(
-            props['is_grayscale'], props['is_small'], props['is_square']))
-        print("    - Spatial variance: {:.4f}".format(props['spatial_variance']))
-        print("    - Num classes: {}".format(self.metadata['num_classes']))
+        print(
+            "    - Resolution: {}x{}, Channels: {}".format(
+                props["height"], props["width"], props["channels"]
+            )
+        )
+        print(
+            "    - Grayscale: {}, Small: {}, Square: {}".format(
+                props["is_grayscale"], props["is_small"], props["is_square"]
+            )
+        )
+        print(
+            "    - Structured: {}, standardized: {}, low-var RGB: {}".format(
+                props.get("is_structured", False),
+                props.get("is_standardized", False),
+                props.get("low_variance_color", False),
+            )
+        )
+        print(
+            "    - Flip safety: horizontal={}, vertical={}".format(
+                props.get("horizontal_flip_safe", False),
+                props.get("vertical_flip_safe", False),
+            )
+        )
+        print(
+            "    - Spatial variance: {:.4f}, normalized: {:.4f}".format(
+                props["spatial_variance"],
+                props.get("normalized_spatial_variance", 0.0),
+            )
+        )
+        print(
+            "    - Class imbalance ratio: {:.2f}".format(
+                props["class_imbalance_ratio"]
+            )
+        )
+        print("    - Num classes: {}".format(self.metadata["num_classes"]))
         print("    - Train samples: {}".format(len(self.train_x)))

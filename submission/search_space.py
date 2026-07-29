@@ -8,6 +8,7 @@ is a standalone nn.Module — no mixed-ops or discretization required.
 
 import math
 import random
+import itertools
 from collections import namedtuple
 
 import torch
@@ -216,25 +217,30 @@ class SearchSpace:
         print("  [SearchSpace] Input: {}ch x {}x{}, {} classes, max_stages={}".format(
             in_channels, input_height, input_width, num_classes, self.max_safe_stages))
 
-    def sample(self, n=1):
-        """Sample n random architecture specs from the space."""
-        specs = []
+    def all_specs(self):
+        """Enumerate every valid architecture exactly once."""
         safe_stages = [s for s in self.NUM_STAGES if s <= self.max_safe_stages]
         if not safe_stages:
             safe_stages = [1]
-
-        for _ in range(n):
-            spec = ArchSpec(
-                num_stages=random.choice(safe_stages),
-                init_channels=random.choice(self.INIT_CHANNELS),
-                blocks_per_stage=random.choice(self.BLOCKS_PER_STAGE),
-                block_type=random.choice(self.BLOCK_TYPES),
-                kernel_size=random.choice(self.KERNEL_SIZES),
-                use_se=random.choice(self.USE_SE),
-                stem_kernel=random.choice(self.STEM_KERNELS),
+        return [
+            ArchSpec(*values)
+            for values in itertools.product(
+                safe_stages,
+                self.INIT_CHANNELS,
+                self.BLOCKS_PER_STAGE,
+                self.BLOCK_TYPES,
+                self.KERNEL_SIZES,
+                self.USE_SE,
+                self.STEM_KERNELS,
             )
-            specs.append(spec)
-        return specs
+        ]
+
+    def sample(self, n=1, rng=None):
+        """Sample unique architecture specs without replacement."""
+        rng = rng or random
+        population = self.all_specs()
+        n = min(max(0, int(n)), len(population))
+        return rng.sample(population, n)
 
     def build_model(self, spec):
         """Construct a full PyTorch model from an ArchSpec."""
@@ -272,9 +278,11 @@ class SearchSpace:
             stages.append(nn.Sequential(*blocks))
 
         # --- Head ---
+        dropout = 0.15 if spec.init_channels >= 64 else (0.10 if spec.init_channels >= 32 else 0.05)
         head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
+            nn.Dropout(p=dropout),
             nn.Linear(current_channels, self.num_classes),
         )
 
@@ -282,6 +290,40 @@ class SearchSpace:
         model = FlexibleNetwork(stem, stages, head)
         model.apply(_init_weights)
         return model
+
+    def parameter_count(self, spec):
+        """Return the exact trainable parameter count without building a model."""
+        total = (
+            self.in_channels * spec.init_channels * spec.stem_kernel ** 2
+            + 2 * spec.init_channels  # stem BatchNorm
+        )
+        current_channels = spec.init_channels
+
+        for stage_idx in range(spec.num_stages):
+            out_channels = spec.init_channels * (2 ** stage_idx)
+            for block_idx in range(spec.blocks_per_stage):
+                stride = 2 if (stage_idx > 0 and block_idx == 0) else 1
+
+                if spec.block_type == 'basic':
+                    total += current_channels * out_channels * spec.kernel_size ** 2
+                    total += 2 * out_channels
+                    total += out_channels * out_channels * spec.kernel_size ** 2
+                    total += 2 * out_channels
+                else:
+                    mid = max(8, out_channels // 4)
+                    total += current_channels * mid + 2 * mid
+                    total += mid * mid * spec.kernel_size ** 2 + 2 * mid
+                    total += mid * out_channels + 2 * out_channels
+
+                if stride != 1 or current_channels != out_channels:
+                    total += current_channels * out_channels + 2 * out_channels
+                if spec.use_se:
+                    se_mid = max(1, out_channels // 16)
+                    total += 2 * out_channels * se_mid
+                current_channels = out_channels
+
+        total += current_channels * self.num_classes + self.num_classes
+        return int(total)
 
     @property
     def size(self):

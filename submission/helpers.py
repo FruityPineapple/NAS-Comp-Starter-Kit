@@ -1,164 +1,150 @@
-"""
-helpers.py — Shared utilities for the NAS Unseen-Data 2026 submission.
-
-Contains time-display helpers, GPU memory estimation, and logging utilities
-used across DataProcessor, NAS, and Trainer.
-"""
+"""Shared time, device, batch-size, and data-fingerprint helpers."""
 
 import math
-import torch
+
 import numpy as np
+import torch
 
 
-# =============================================================================
-# Time display
-# =============================================================================
-
-def div_remainder(n, interval):
-    """Find divisor and remainder given n / interval."""
-    factor = math.floor(n / interval)
-    remainder = int(n - (factor * interval))
+def div_remainder(value, interval):
+    factor = math.floor(value / interval)
+    remainder = int(value - factor * interval)
     return factor, remainder
 
 
 def show_time(seconds):
-    """Format a duration in seconds as a human-readable string."""
+    seconds = float(seconds)
     if seconds < 0:
         return "-" + show_time(-seconds)
     if seconds < 60:
         return "{:.2f}s".format(seconds)
-    elif seconds < (60 * 60):
+    if seconds < 3600:
         minutes, secs = div_remainder(seconds, 60)
         return "{}m,{}s".format(minutes, secs)
-    else:
-        hours, secs = div_remainder(seconds, 60 * 60)
-        minutes, secs = div_remainder(secs, 60)
-        return "{}h,{}m,{}s".format(hours, minutes, secs)
+    hours, remainder = div_remainder(seconds, 3600)
+    minutes, secs = div_remainder(remainder, 60)
+    return "{}h,{}m,{}s".format(hours, minutes, secs)
 
 
-# =============================================================================
-# Time budget management
-# =============================================================================
-
-# Budget fractions (of the per-dataset time_limit)
-BUDGET_DATA_PROCESSING = 0.03   # ~3%
-BUDGET_NAS_SEARCH      = 0.12   # ~12%
-BUDGET_HPO             = 0.05   # ~5%  (conditional)
-BUDGET_TRAINING        = 0.65   # ~65%
-BUDGET_ENSEMBLE_TRAIN  = 0.10   # ~10% (conditional)
-BUDGET_SAFETY_MARGIN   = 0.05   # ~5%
-
-# Tier thresholds (in seconds)
-TIER3_THRESHOLD = 5 * 60    # <5 min  → immediate fallback
-TIER2_THRESHOLD = 15 * 60   # <15 min → ZCP-only, no learning curve
+TIER3_THRESHOLD = 5 * 60
+TIER2_THRESHOLD = 15 * 60
 
 
 def get_tier(clock):
-    """Determine the operating tier based on remaining time."""
     remaining = clock.check()
     if remaining < TIER3_THRESHOLD:
         return 3
-    elif remaining < TIER2_THRESHOLD:
+    if remaining < TIER2_THRESHOLD:
         return 2
-    else:
-        return 1
+    return 1
 
-
-def time_budget_for(clock, fraction):
-    """Return the absolute number of seconds allocated for a phase."""
-    return max(0, clock.check() * fraction)
-
-
-# =============================================================================
-# GPU / memory helpers
-# =============================================================================
 
 def get_device():
-    """Return the best available device."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def estimate_batch_size(input_shape, base_batch_size=128, min_batch_size=8):
-    """
-    Heuristic batch size based on input tensor size.
-
-    For very large inputs (high-res, many channels) we reduce the batch size
-    to avoid OOM.  For small inputs we can increase it.
-    """
-    # input_shape = [n, C, H, W]
+    """Conservative resolution- and GPU-memory-aware batch-size heuristic."""
     if len(input_shape) == 4:
-        _, c, h, w = input_shape
+        _, channels, height, width = input_shape
     elif len(input_shape) == 3:
-        # missing channel dim
-        _, h, w = input_shape
-        c = 1
+        _, height, width = input_shape
+        channels = 1
     else:
         return base_batch_size
 
-    pixels = c * h * w
-
-    # Reference: 3×32×32 = 3072 pixels → batch 128 is fine
+    pixels = channels * height * width
     if pixels <= 3072:
         batch_size = base_batch_size
-    elif pixels <= 12288:   # e.g. 3×64×64
+    elif pixels <= 12288:
         batch_size = base_batch_size // 2
-    elif pixels <= 49152:   # e.g. 3×128×128
+    elif pixels <= 49152:
         batch_size = base_batch_size // 4
     else:
         batch_size = base_batch_size // 8
 
-    return max(min_batch_size, batch_size)
+    if torch.cuda.is_available():
+        try:
+            memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if memory_gb < 8:
+                batch_size //= 2
+            elif memory_gb >= 20 and pixels <= 12288:
+                batch_size *= 2
+        except Exception:
+            pass
+    return max(min_batch_size, int(batch_size))
 
-
-# =============================================================================
-# Data inspection helpers
-# =============================================================================
 
 def inspect_data_properties(train_x):
-    """
-    Analyze training data to inform adaptive augmentation decisions.
-
-    Returns a dict with:
-        - 'channels': int
-        - 'height': int
-        - 'width': int
-        - 'is_small': bool    (spatial dims <= 8)
-        - 'is_grayscale': bool (1 channel)
-        - 'is_square': bool
-        - 'spatial_variance': float  (mean variance across spatial dims)
-    """
+    """Build scale-aware fingerprints from a deterministic sample."""
     shape = train_x.shape
     if len(shape) == 4:
-        n, c, h, w = shape
+        n, channels, height, width = shape
     elif len(shape) == 3:
-        n, h, w = shape
-        c = 1
+        n, height, width = shape
+        channels = 1
     else:
-        # Unexpected shape — return safe defaults
         return {
-            'channels': 1, 'height': 1, 'width': 1,
-            'is_small': True, 'is_grayscale': True, 'is_square': True,
-            'spatial_variance': 0.0,
+            "channels": 1,
+            "height": 1,
+            "width": 1,
+            "is_small": True,
+            "is_grayscale": True,
+            "is_square": True,
+            "spatial_variance": 0.0,
+            "normalized_spatial_variance": 0.0,
+            "value_mean": 0.0,
+            "value_std": 0.0,
+            "value_min": 0.0,
+            "value_max": 0.0,
+            "is_standardized": False,
+            "low_variance_color": False,
+            "is_structured": True,
         }
 
-    # Compute spatial variance on a small sample to save time
-    sample_size = min(n, 200)
-    sample = train_x[:sample_size].astype(np.float32)
+    sample_size = min(n, 256)
+    indices = np.linspace(0, n - 1, sample_size, dtype=np.int64)
+    sample = np.asarray(train_x[indices], dtype=np.float32)
     if len(shape) == 3:
-        sample = sample.reshape(sample_size, 1, h, w)
+        sample = sample.reshape(sample_size, 1, height, width)
 
-    # Mean variance across spatial dimensions (per-channel, averaged)
-    # High spatial variance → natural images; low → structured / synthetic
-    spatial_var = np.mean(np.var(sample, axis=(2, 3)))
+    spatial_variance = float(np.mean(np.var(sample, axis=(2, 3))))
+    total_variance = float(np.mean(np.var(sample, axis=(0, 2, 3))))
+    normalized_spatial_variance = spatial_variance / max(total_variance, 1e-8)
+    value_mean = float(np.mean(sample))
+    value_std = float(np.std(sample))
+    value_min = float(np.min(sample))
+    value_max = float(np.max(sample))
+
+    is_small = height <= 8 or width <= 8
+    is_grayscale = channels == 1
+    is_standardized = (
+        value_min < -0.5
+        and value_max > 1.5
+        and abs(value_mean) < 0.5
+        and 0.4 <= value_std <= 2.5
+    )
+    low_variance_color = (
+        channels >= 3
+        and value_min >= -0.1
+        and value_max <= 1.5
+        and spatial_variance < 0.15
+    )
 
     return {
-        'channels': c,
-        'height': h,
-        'width': w,
-        'is_small': (h <= 8 or w <= 8),
-        'is_grayscale': (c == 1),
-        'is_square': (h == w),
-        'spatial_variance': float(spatial_var),
+        "channels": int(channels),
+        "height": int(height),
+        "width": int(width),
+        "is_small": bool(is_small),
+        "is_grayscale": bool(is_grayscale),
+        "is_square": bool(height == width),
+        "spatial_variance": spatial_variance,
+        "normalized_spatial_variance": float(normalized_spatial_variance),
+        "value_mean": value_mean,
+        "value_std": value_std,
+        "value_min": value_min,
+        "value_max": value_max,
+        "is_standardized": bool(is_standardized),
+        "low_variance_color": bool(low_variance_color),
+        "is_structured": bool(is_small or is_grayscale or is_standardized),
     }

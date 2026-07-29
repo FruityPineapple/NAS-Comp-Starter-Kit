@@ -1,355 +1,217 @@
-"""
-zero_cost_proxies.py — Self-contained zero-cost proxy implementations.
+"""Deterministic zero-cost proxies used by the compute-aware NAS search."""
 
-Three proxies for rapidly ranking candidate architectures without training:
-  - synflow:   Data-agnostic parameter saliency via gradient flow
-  - jacob_cov: Data-dependent Jacobian covariance (gradient diversity)
-  - naswot:    Data-dependent activation pattern diversity
+import math
 
-Plus rank aggregation via Borda count for combining multiple proxy scores.
-"""
-
-import time
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
 
-# =============================================================================
-# Synflow
-# =============================================================================
+def _get_input_batch(data_source, num_samples, device):
+    """Return a fixed input tensor from either a tensor or a DataLoader."""
+    if torch.is_tensor(data_source):
+        return data_source[:num_samples].detach().to(device)
 
-def compute_synflow(model, input_shape, device):
-    """
-    Compute the Synflow (Synaptic Flow) score for a model.
-
-    Data-agnostic proxy that measures parameter saliency by computing
-    the sum of (gradient * parameter) products through the network.
-
-    Args:
-        model: nn.Module to evaluate
-        input_shape: tuple (C, H, W) of the input tensor
-        device: torch device
-
-    Returns:
-        float: log(synflow_score) — higher is better
-    """
-    try:
-        # Save original state
-        original_state = {k: v.clone() for k, v in model.state_dict().items()}
-        model.to(device)
-        model.eval()
-
-        # Set all parameters to their absolute values
-        for p in model.parameters():
-            p.data = p.data.abs()
-            p.requires_grad_(True)
-
-        # Forward pass with all-ones input
-        x = torch.ones(1, *input_shape, device=device)
-        output = model(x)
-        loss = output.sum()
-
-        # Backward pass
-        loss.backward()
-
-        # Score = sum of (grad * param) across all parameters
-        score = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                score += (p.grad * p.data).sum().item()
-
-        # Restore original state
-        model.load_state_dict(original_state)
-        model.zero_grad()
-
-        return float(np.log(abs(score) + 1e-8))
-
-    except Exception:
-        try:
-            model.load_state_dict(original_state)
-        except Exception:
-            pass
-        return 0.0
-
-
-# =============================================================================
-# Jacob_cov
-# =============================================================================
-
-def compute_jacob_cov(model, dataloader, num_classes, device, num_samples=32):
-    """
-    Compute the Jacobian covariance score for a model.
-
-    Data-dependent proxy that measures the diversity of gradients
-    of the output w.r.t. the input across different classes.
-
-    Args:
-        model: nn.Module to evaluate
-        dataloader: DataLoader providing input batches
-        num_classes: number of output classes
-        device: torch device
-        num_samples: number of input samples to use
-
-    Returns:
-        float: log|det(J @ J^T)| — higher means more diverse gradients
-    """
-    try:
-        model.to(device)
-        model.eval()
-
-        # Get a batch of inputs
-        inputs = _get_input_batch(dataloader, num_samples, device)
-        inputs.requires_grad_(True)
-
-        # Forward pass
-        logits = model(inputs)
-
-        # Compute Jacobian rows for a subset of classes
-        num_classes_to_use = min(num_classes, 10)
-        jacobian_rows = []
-
-        for j in range(num_classes_to_use):
-            model.zero_grad()
-            if inputs.grad is not None:
-                inputs.grad = None
-
-            logits[:, j].sum().backward(retain_graph=True)
-
-            if inputs.grad is not None:
-                grad_j = inputs.grad.detach().clone().flatten()
-                jacobian_rows.append(grad_j)
-
-        if len(jacobian_rows) < 2:
-            return 0.0
-
-        # Stack into matrix J [num_classes_used, flattened_input_dim]
-        J = torch.stack(jacobian_rows)
-
-        # Correlation matrix K = J @ J^T
-        K = J @ J.T
-
-        # Score = log|det(K)|
-        sign, logdet = torch.slogdet(K)
-        score = logdet.item()
-
-        if np.isnan(score) or np.isinf(score):
-            return 0.0
-
-        model.zero_grad()
-        return score
-
-    except Exception:
-        return 0.0
-
-
-# =============================================================================
-# NASWOT
-# =============================================================================
-
-class _ActivationHook:
-    """Forward hook that captures binary activation patterns after ReLU."""
-
-    def __init__(self):
-        self.activations = None
-
-    def __call__(self, module, input, output):
-        # Binary activation: which neurons fired (> 0)
-        self.activations = (output > 0).float().detach()
-
-
-def compute_naswot(model, dataloader, device, num_samples=32):
-    """
-    Compute the NASWOT (NAS Without Training) score for a model.
-
-    Data-dependent proxy that measures the diversity of activation patterns
-    across different inputs. More diverse patterns = better architecture.
-
-    Args:
-        model: nn.Module to evaluate
-        dataloader: DataLoader providing input batches
-        device: torch device
-        num_samples: number of input samples to use
-
-    Returns:
-        float: log|det(K)| where K is the activation kernel matrix
-    """
-    try:
-        model.to(device)
-        model.eval()
-
-        # Register hooks on all ReLU modules
-        hooks = []
-        hook_objs = []
-        for module in model.modules():
-            if isinstance(module, nn.ReLU):
-                h = _ActivationHook()
-                hook_objs.append(h)
-                hooks.append(module.register_forward_hook(h))
-
-        if not hooks:
-            # No ReLU layers found — try looking for functional relus via any module
-            for h in hooks:
-                h.remove()
-            return 0.0
-
-        # Get a batch and do a forward pass
-        inputs = _get_input_batch(dataloader, num_samples, device)
-
-        with torch.no_grad():
-            model(inputs)
-
-        # Collect binary activation codes
-        # Each hook captured [B, C, H, W] of binary activations
-        binary_codes = []
-        for h in hook_objs:
-            if h.activations is not None:
-                # Flatten spatial dims: [B, C*H*W]
-                flat = h.activations.view(h.activations.shape[0], -1)
-                binary_codes.append(flat)
-
-        # Remove hooks
-        for h in hooks:
-            h.remove()
-
-        if not binary_codes:
-            return 0.0
-
-        # Concatenate across all layers: [B, total_neurons]
-        K_binary = torch.cat(binary_codes, dim=1).to(device)
-
-        # Limit feature dim to avoid memory issues
-        if K_binary.shape[1] > 50000:
-            indices = torch.randperm(K_binary.shape[1])[:50000]
-            K_binary = K_binary[:, indices]
-
-        # Kernel matrix: K = binary_codes @ binary_codes^T
-        K = K_binary @ K_binary.T
-
-        # Score = log|det(K)|
-        sign, logdet = torch.slogdet(K)
-        score = logdet.item()
-
-        if np.isnan(score) or np.isinf(score):
-            return 0.0
-
-        return score
-
-    except Exception:
-        # Clean up hooks on failure
-        for h in hooks:
-            try:
-                h.remove()
-            except Exception:
-                pass
-        return 0.0
-
-
-# =============================================================================
-# Utilities
-# =============================================================================
-
-def _get_input_batch(dataloader, num_samples, device):
-    """Extract a batch of input tensors from a dataloader."""
     collected = []
     count = 0
-    for batch in dataloader:
-        # Handle both (data, labels) and (data,) formats
-        if isinstance(batch, (list, tuple)):
-            data = batch[0]
-        else:
-            data = batch
-
+    for batch in data_source:
+        data = batch[0] if isinstance(batch, (list, tuple)) else batch
         collected.append(data)
         count += data.shape[0]
         if count >= num_samples:
             break
+    if not collected:
+        raise ValueError("Cannot compute a proxy from an empty data source")
+    return torch.cat(collected, dim=0)[:num_samples].detach().to(device)
 
-    inputs = torch.cat(collected, dim=0)[:num_samples]
-    return inputs.to(device)
 
-
-def compute_all_proxies(model, dataloader, input_shape, num_classes, device):
-    """
-    Compute all three zero-cost proxies for a model.
-
-    Args:
-        model: nn.Module to evaluate
-        dataloader: training DataLoader
-        input_shape: tuple (C, H, W)
-        num_classes: number of output classes
-        device: torch device
-
-    Returns:
-        dict: {'synflow': float, 'jacob_cov': float, 'naswot': float}
-    """
-    scores = {}
-
-    # Synflow (data-agnostic)
-    t0 = time.time()
+def compute_synflow(model, input_shape, device):
+    """SynFlow saliency, returned on a log scale."""
+    original_state = None
     try:
-        scores['synflow'] = compute_synflow(model, input_shape, device)
+        original_state = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+        model.to(device)
+        model.eval()
+        model.zero_grad(set_to_none=True)
+
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.abs_()
+
+        inputs = torch.ones(1, *input_shape, device=device)
+        model(inputs).sum().backward()
+
+        score = 0.0
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                score += float((parameter.grad * parameter).abs().sum().item())
+
+        return float(math.log(score + 1e-12))
     except Exception:
-        scores['synflow'] = 0.0
-    t_sf = time.time() - t0
-
-    # Jacob_cov (data-dependent)
-    t0 = time.time()
-    try:
-        scores['jacob_cov'] = compute_jacob_cov(model, dataloader, num_classes, device)
-    except Exception:
-        scores['jacob_cov'] = 0.0
-    t_jc = time.time() - t0
-
-    # NASWOT (data-dependent)
-    t0 = time.time()
-    try:
-        scores['naswot'] = compute_naswot(model, dataloader, device)
-    except Exception:
-        scores['naswot'] = 0.0
-    t_nw = time.time() - t0
-
-    return scores
+        return float("nan")
+    finally:
+        if original_state is not None:
+            try:
+                model.load_state_dict(original_state)
+            except Exception:
+                pass
+        model.zero_grad(set_to_none=True)
 
 
-# =============================================================================
-# Rank Aggregation
-# =============================================================================
-
-def rank_aggregate(proxy_scores_list):
+def compute_jacob_cov(model, data_source, num_classes, device, num_samples=24):
     """
-    Aggregate multiple proxy scores via Borda count.
+    Jacobian correlation score.
 
-    Args:
-        proxy_scores_list: list of dicts, each mapping proxy_name -> score.
-                           One dict per candidate architecture.
-
-    Returns:
-        list[int]: indices of architectures sorted by average rank (best first)
+    Rows correspond to samples (rather than output classes), matching the
+    quantity the proxy is intended to measure.  A single backward pass keeps
+    this affordable and deterministic.
     """
-    n = len(proxy_scores_list)
-    if n == 0:
+    del num_classes  # Kept in the public signature for evaluator compatibility.
+    try:
+        model.to(device)
+        model.eval()
+        model.zero_grad(set_to_none=True)
+
+        inputs = _get_input_batch(data_source, num_samples, device)
+        inputs = inputs.clone().requires_grad_(True)
+        logits = model(inputs)
+        jacobian = torch.autograd.grad(
+            logits.sum(), inputs, retain_graph=False, create_graph=False
+        )[0]
+        jacobian = jacobian.flatten(1)
+        jacobian = jacobian / jacobian.norm(dim=1, keepdim=True).clamp_min(1e-8)
+
+        correlation = jacobian @ jacobian.t()
+        eps = 1e-5
+        eigenvalues = torch.linalg.eigvalsh(
+            correlation + eps * torch.eye(correlation.size(0), device=device)
+        ).clamp_min(eps)
+        score = -torch.sum(torch.log(eigenvalues) + 1.0 / eigenvalues)
+        value = float(score.item())
+        return value if math.isfinite(value) else float("nan")
+    except Exception:
+        return float("nan")
+    finally:
+        model.zero_grad(set_to_none=True)
+
+
+def compute_naswot(model, data_source, device, num_samples=24):
+    """
+    NASWOT log-determinant using agreements of active and inactive neurons.
+
+    The kernel is accumulated inside hooks, so repeated uses of the same ReLU
+    module and all residual-block activations contribute without concatenating
+    enormous activation tensors.
+    """
+    handles = []
+    try:
+        model.to(device)
+        model.eval()
+        inputs = _get_input_batch(data_source, num_samples, device)
+        batch_size = inputs.shape[0]
+        kernel = torch.zeros(batch_size, batch_size, device=device)
+
+        def activation_hook(module, hook_inputs, output):
+            del module, hook_inputs
+            if not torch.is_tensor(output) or output.shape[0] != batch_size:
+                return
+            binary = (output.detach() > 0).flatten(1).float()
+            kernel.add_(binary @ binary.t())
+            inverse = 1.0 - binary
+            kernel.add_(inverse @ inverse.t())
+
+        for module in model.modules():
+            if isinstance(module, nn.ReLU):
+                handles.append(module.register_forward_hook(activation_hook))
+
+        if not handles:
+            return float("nan")
+
+        with torch.no_grad():
+            model(inputs)
+
+        eps = 1e-6
+        sign, logdet = torch.linalg.slogdet(
+            kernel + eps * torch.eye(batch_size, device=device)
+        )
+        value = float(logdet.item())
+        if sign.item() <= 0 or not math.isfinite(value):
+            return float("nan")
+        return value
+    except Exception:
+        return float("nan")
+    finally:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+
+
+def compute_all_proxies(model, data_source, input_shape, num_classes, device):
+    """Compute all proxies on the same cached calibration inputs."""
+    return {
+        "synflow": compute_synflow(model, input_shape, device),
+        "jacob_cov": compute_jacob_cov(model, data_source, num_classes, device),
+        "naswot": compute_naswot(model, data_source, device),
+    }
+
+
+def _average_tie_ranks(values, higher_is_better=True):
+    """Return zero-based average ranks while treating equal/invalid values fairly."""
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.full(len(values), (len(values) - 1) / 2.0)
+
+    worst = np.nanmin(values[finite]) - max(1.0, np.nanstd(values[finite]))
+    clean = np.where(finite, values, worst)
+    order = np.argsort(-clean if higher_is_better else clean, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float64)
+
+    position = 0
+    while position < len(order):
+        end = position + 1
+        while end < len(order) and clean[order[end]] == clean[order[position]]:
+            end += 1
+        average_rank = 0.5 * (position + end - 1)
+        ranks[order[position:end]] = average_rank
+        position = end
+    return ranks
+
+
+def rank_aggregate(proxy_scores_list, weights=None):
+    """
+    Weighted Borda aggregation with tie handling.
+
+    Additional higher-is-better fields such as ``efficiency`` can be supplied
+    by the NAS controller.  Failed proxies receive the worst rank instead of an
+    arbitrary order.
+    """
+    if not proxy_scores_list:
         return []
-    if n == 1:
+    if len(proxy_scores_list) == 1:
         return [0]
 
-    # Get all proxy names from the first entry
-    proxy_names = list(proxy_scores_list[0].keys())
+    weights = weights or {
+        "synflow": 0.25,
+        "jacob_cov": 0.75,
+        "naswot": 1.0,
+        "efficiency": 0.50,
+    }
+    rank_sum = np.zeros(len(proxy_scores_list), dtype=np.float64)
+    total_weight = 0.0
 
-    # Compute per-proxy rankings (higher score = better = lower rank number)
-    rank_sums = np.zeros(n)
+    for name, weight in weights.items():
+        if weight <= 0 or not any(name in entry for entry in proxy_scores_list):
+            continue
+        values = [entry.get(name, float("nan")) for entry in proxy_scores_list]
+        rank_sum += float(weight) * _average_tie_ranks(values, higher_is_better=True)
+        total_weight += float(weight)
 
-    for proxy in proxy_names:
-        scores = [entry.get(proxy, 0.0) for entry in proxy_scores_list]
-        # argsort ascending, then invert to get ranks (0 = best)
-        order = np.argsort(scores)[::-1]  # indices sorted by score descending
-        ranks = np.zeros(n)
-        for rank, idx in enumerate(order):
-            ranks[idx] = rank
-        rank_sums += ranks
-
-    # Average rank across proxies
-    avg_ranks = rank_sums / len(proxy_names)
-
-    # Return indices sorted by average rank (lowest = best)
-    return list(np.argsort(avg_ranks))
+    if total_weight == 0:
+        return list(range(len(proxy_scores_list)))
+    return list(np.argsort(rank_sum / total_weight, kind="mergesort"))
