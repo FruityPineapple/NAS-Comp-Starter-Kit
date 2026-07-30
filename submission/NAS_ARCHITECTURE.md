@@ -1,521 +1,278 @@
-# Architektur des NAS
+# NAS Architecture
 
-Stand: 30. Juli 2026
+Status: 30 July 2026
 
-## Aktiver Controller-Stand nach der Log-Analyse
+This document describes the active competition implementation. The code is
+authoritative if a future change makes this document stale.
 
-Dieser Abschnitt ersetzt bei Widerspruechen die aelteren Beschreibungen
-weiter unten:
+## 1. Competition interface and invariants
 
-- Architektur und Trainingsrecipe sind entkoppelt. Alle Architekturen werden
-  zuerst mit demselben neutralen `architecture_probe` verglichen.
-- Familienquoten enthalten bewusst verschiedene Parametergroessen. Proxies
-  dienen nur dem Pre-Screen und gehen nicht mehr in die labelbasierte Utility
-  ein.
-- AdamW-Zustaende bleiben ueber Fidelity-Runden erhalten. Eine kleine
-  Plateau-Regel senkt dabei die Search-LR ohne die Momente zu verwerfen.
-- Die Full-Data-Fidelity ist adaptiv. Faire weitere Paesse laufen, solange
-  mindestens ein Finalist noch messbar lernt und beide denselben Schrittumfang
-  erhalten koennen.
-- Die Architekturentscheidung kombiniert Full Validation, die vorherige
-  Fidelity und Rangstabilitaet ueber die Lernkurve.
-- Erst danach vergleicht ein separates, zweistufiges Recipe-Rennen Recipes auf
-  Klonen desselben Architektur-Checkpoints. Der unveraenderte Checkpoint ist
-  ein expliziter Incumbent und wird auf exakt derselben Validation-Quelle
-  bewertet.
-- Alle Recipes starten mit identischen Gewichten, Datenreihenfolgen und Seeds.
-  Wenn es die Clock erlaubt, erhalten die zwei besten Recipes eine zweite
-  gleich grosse Stufe. Validation-Accuracy bleibt das Hauptsignal; eine
-  begrenzte Validation-Loss-Steigung entscheidet knappe, noch lernende
-  Kandidaten.
-- Pro Recipe bleibt das beste bewertete Stufen-Checkpoint samt zugehoerigem
-  Optimizer-State erhalten. Ein Recipe ersetzt den Incumbent nur ab mindestens
-  0,10 Prozentpunkten beziehungsweise einem zusaetzlich korrekt klassifizierten
-  Validation-Beispiel. Andernfalls bleiben Incumbent-Gewichte und deren
-  Optimizer-State unveraendert.
-- Axis-Encoder besitzen eine parameterfreie absolute Positionskodierung und
-  mehrere geordnete Pooling-Bins statt eines einzigen globalen Mittelwerts.
-- Der finale Trainer verwendet bei einem ausgeschoepften Versuch keinen
-  Low-LR-Neustart im selben Minimum. Er startet einen unabhaengigen Versuch
-  aus dem gemeinsamen NAS-Checkpoint mit neuer Recipe, neuem Seed und neuem
-  Optimizer. Unterhalb des Benchmarks darf eine weitere noch ungetestete
-  Recipe folgen. Das global beste Checkpoint bleibt geschuetzt.
-- Liegt die Validation unter dem gelieferten Benchmark, wird verbleibende Zeit
-  bevorzugt fuer diesen unabhaengigen Versuch eingesetzt. Das Competition-
-  Zeitlimit und die Prediction-Reserve bleiben harte Grenzen.
+The evaluator calls:
 
-Dieses Dokument beschreibt die aktive Competition-Submission. Änderungen an
-Datenverarbeitung, Suchraum, Controller, Training oder Packaging müssen hier
-im selben Arbeitsschritt dokumentiert werden.
+- `DataProcessor.process()` and expects ordered train, validation, and test
+  loaders;
+- `NAS.search()` and expects one `torch.nn.Module`;
+- `Trainer.train()` and expects one trained `torch.nn.Module`;
+- `Trainer.predict()` and expects one class prediction for every test example.
 
-## 1. Ziel und Competition-Schnittstelle
+The controller never routes on the dataset codename and never reads test
+labels. It uses tensor contents, shapes, class statistics, validation
+measurements, resource measurements, and the supplied clock. The active
+submission contains no DARTS, einspace grammar, supernet weight sharing,
+external pretrained weights, or final ensemble.
 
-Für jedes unbekannte Dataset muss die Submission innerhalb eines variablen
-Zeitlimits:
+Organizer-owned files under `evaluation/` are not part of the implementation
+and must not be modified or packaged as submission code.
 
-1. NumPy-Daten in DataLoader überführen,
-2. eine Architektur suchen,
-3. das gewählte Modell trainieren,
-4. für sämtliche Testbeispiele Vorhersagen erzeugen.
+## 2. Data processing and memory behavior
 
-Der offizielle Evaluator erwartet:
+`data_processor.py` and `helpers.py` build a deterministic data profile.
+Fingerprint sample counts are constrained by both an example limit and a byte
+limit. The profile records:
 
-- `DataProcessor.process() -> train_loader, valid_loader, test_loader`
-- `NAS.search() -> torch.nn.Module`
-- `Trainer.train() -> torch.nn.Module`
-- `Trainer.predict(test_loader) -> predictions`
+- actual channels, height, width, value range, moments, and spatial variance;
+- sparse/binary and row/column one-hot structure;
+- categorical-width, categorical-height, dense-sequence, position-sensitive,
+  board, channel-independent, volumetric, temporal, factorized, and
+  natural-image confidence;
+- channel correlation, approximate value cardinality, class imbalance, and
+  smoothed inverse-frequency class weights;
+- train/validation moment shift;
+- label-aware horizontal/vertical flip safety.
 
-Die aktive Lösung ist deshalb ein hierarchisches NAS-Portfolio: Während des
-Search werden mehrere unabhängige Kandidaten verglichen, anschließend wird
-genau ein Modell zurückgegeben und final trainiert. Es gibt kein DARTS, kein
-einspace, kein Supernet-Weight-Sharing und kein finales Ensemble.
+`NASDataset` keeps the source storage dtype. A `uint8` or `float64` dataset is
+not converted wholesale to float32; each requested example is converted just
+before its transform. Channel normalization is computed with float64
+accumulators over deterministic float32 chunks capped at 16 MiB by default.
+The data fingerprint, shift sample, and flip-safety sample also have byte
+ceilings.
 
-Alle Entscheidungen basieren auf Dateninhalt, Tensorform, Klassenverteilung,
-gemessener Laufzeit und Validation-Ergebnissen. Dataset-Codenamen werden nicht
-verwendet.
+The test loader is never shuffled and never drops its last batch.
 
-## 2. Motivation der Überarbeitung
+## 3. Augmentation portfolio
 
-Der vorherige Controller hatte vier zentrale Schwächen:
+Every dataset exposes an identity/evaluation transform. Depending on the
+fingerprint, the safe training portfolio can also contain:
 
-- Eine einzelne boolesche Categorical-Grid-Erkennung entschied, ob überhaupt
-  ein Axis-Modell gesucht wurde. LaMelo fiel wegen seiner niedrigen
-  One-Hot-Spaltenquote aus diesem Pfad, obwohl die andere Achse strukturiert
-  sein kann.
-- Der aktive Suchraum bestand ansonsten nur aus homogenen Residual-CNNs mit
-  Global Average Pooling. Damit fehlten positionssensitive, achsenorientierte
-  und effizient factorisierte Alternativen.
-- Zero-Cost-Proxies beeinflussten zu stark, welche Kandidaten labelbasiertes
-  Training erhielten. Die Search-Zeit und Datenabdeckung waren sehr klein.
-- Auf Gutenberg beendete Early Stopping das Training bereits nach 28 Epochen,
-  während die Learning Rate noch fast am Maximum lag und über 25 Minuten
-  ungenutzt blieben.
+- `conservative`: small crop or translation, verified flips, and cautious
+  erasing for suitable natural-image inputs;
+- `safe_flips`: only flips that passed the label-aware invariance check.
 
-Die aktuelle Architektur behebt diese Fehler auf Controller-Ebene, ohne auf
-einen unbeschränkten Grammar-Search oder ein differentielles Supernet
-umzubauen.
+Detected train/validation shift makes identity the initial incumbent.
+Before proxy screening starts, NAS trains byte-identical compact anchors with
+the same examples and seed under every available policy. A policy replaces
+the incumbent only after a validation-accuracy gain beyond the sampling margin
+or an accuracy tie with a material validation-loss improvement. This occurs
+before worker processes have consumed the training dataset, so the selected
+policy is the one seen by later search and training.
 
-## 3. Gesamtpipeline
+## 4. Architecture portfolio
 
-```text
-Raw arrays
-    |
-    v
-DataProcessor
-  - mehrere Repräsentationshypothesen
-  - Normalisierung und konservative Augmentierung
-  - Klassenstatistik und Loader
-    |
-    v
-Hierarchischer NAS-Controller
-  - kleines Portfolio starker Familien
-  - Architektur + Trainingsrezept
-  - Proxy-Pre-Screen ohne harte Gate-Wirkung
-  - labelbasierte Zeitquanten
-  - Full-Validation Champion/Challenger
-    |
-    v
-Ein warm gestartetes Gewinnermodell
-    |
-    v
-Trainer
-  - gemessener Durchsatz
-  - Warmup, Reduce-on-Plateau, Zeit-Cooldown
-  - bestes Checkpoint
-  - sichere Prediction-Reserve
-```
+All candidates are independent modules. The always-available safety families
+are:
 
-## 4. Mehrhypothesen-Datenprofil
-
-`helpers.inspect_data_properties()` analysiert höchstens 256 deterministisch
-gezogene Trainingsbeispiele. Ermittelt werden:
-
-- tatsächliche Kanalzahl, Höhe und Breite,
-- Wertebereich, Mittelwert, Standardabweichung und räumliche Varianz,
-- Grayscale-, Small-, Square- und Standardized-Eigenschaften,
-- Anteil binärähnlicher Werte und Aktivierungsdichte,
-- Anteil von Spalten mit genau einer Aktivierung,
-- Anteil von Zeilen mit genau einer Aktivierung,
-- Klassenungleichgewicht und geglättete inverse Klassenhäufigkeiten.
-
-Statt eines einzigen Routes werden Konfidenzen ausgegeben:
-
-| Hypothese | Bedeutung |
+| Family | Inductive bias |
 |---|---|
-| `spatial` | Lokale zweidimensionale Struktur bleibt immer möglich |
-| `position_sensitive` | Absolute oder grobe Position kann relevant sein |
-| `sequence_width` | Zeilen/Kanäle sind Features, Spalten bilden die Sequenz |
-| `sequence_height` | Spalten/Kanäle sind Features, Zeilen bilden die Sequenz |
-| `factorized` | Effiziente separable räumliche Verarbeitung ist plausibel |
+| `spatial` | residual 2D CNN with global pooling |
+| `spatial_pyramid` | residual CNN retaining global and 2x2 layout |
+| `factorized` | depthwise-separable residual CNN with GroupNorm |
 
-Eine starke Spaltenstruktur liefert daher nicht nur einen harten Route-Wert.
-Sie erhöht die Width- und schwächer auch die Height-/Dual-Axis-Hypothese.
-Dasselbe gilt symmetrisch für zeilencodierte Daten. Eine räumliche Alternative
-bleibt immer erhalten.
+The content profile can activate:
 
-## 5. Datenverarbeitung
-
-### 5.1 Normalisierung und Speicher
-
-- NumPy-Arrays werden mit `torch.from_numpy` eingebunden.
-- Fehlende Kanaldimensionen werden ergänzt.
-- Tatsächliche Tensorformen ersetzen unzuverlässige nominale Metadaten.
-- Channel-Mittelwerte und Standardabweichungen werden deterministisch auf
-  höchstens 10.000 Beispielen berechnet.
-- Testdaten werden weder geshuffelt noch abgeschnitten.
-
-### 5.2 Augmentierung
-
-Augmentierung bleibt konservativ:
-
-- Starke Sequence-/Grid-Hypothesen erhalten keine geometrische Transformation.
-- Sehr kleine Inputs werden nur normalisiert.
-- Strukturierte Grayscale-Daten erhalten eine kleine Translation nur mit
-  Wahrscheinlichkeit 0,5; Identity-Beispiele bleiben erhalten.
-- Natural-Image-artige Daten können labelgeprüfte Flips, Random Crop und bei
-  größeren Inputs vorsichtiges Random Erasing erhalten.
-- Rotation wird für strukturierte Inputs nicht verwendet.
-
-Die Search-Rezepte variieren zusätzlich Regularisierung, Label Smoothing,
-MixUp und gegebenenfalls Class Weighting. Damit ist Augmentation nicht mehr
-die einzige Regularisierungsquelle.
-
-## 6. Architekturportfolio
-
-Eine Spezifikation enthält weiterhin wenige robuste Makrodimensionen:
-
-- zwei bis vier Stages, soweit die Auflösung dies erlaubt,
-- 16, 32 oder 64 Initialkanäle,
-- ein bis drei Blöcke pro Stage,
-- Basic- oder Bottleneck-Konfiguration,
-- Kernel 3 oder 5,
-- optionale Squeeze-and-Excitation,
-- Stem-Kernel 3, 5 oder 7,
-- Modellfamilie.
-
-Aktive Familien:
-
-| Familie | Zweck |
+| Family | Inductive bias |
 |---|---|
-| `spatial` | bewährter Residual-CNN-Sicherheitsanker mit Global Pooling |
-| `spatial_pyramid` | kombiniert globales Pooling mit grobem 2x2-Layout |
-| `factorized` | depthwise-separable Residualblöcke mit GroupNorm |
-| `axis_width` | 1D-Residualpfad entlang der Breite plus Zeilenfrequenzen |
-| `axis_height` | symmetrischer 1D-Pfad entlang der Höhe |
-| `dual_axis` | fusioniert unabhängige Width- und Height-Encoder |
+| `axis_width` | ordered 1D residual encoder along width |
+| `axis_height` | ordered 1D residual encoder along height |
+| `dual_axis` | fused width and height encoders |
+| `categorical_sequence` | soft token projection, multi-kernel TCN, attention, ordered pooling |
+| `dense_sequence` | per-token LayerNorm/projection, TCN, attention, ordered pooling |
+| `multiview` | shared per-channel 2D encoder with invariant and ordered late fusion |
+| `volumetric` | compact Conv3D over channel/depth and spatial dimensions |
+| `coord_spatial` | explicit normalized coordinates and 1x1/2x2/4x4 pyramid |
+| `spatial_axis` | local 2D features fused with raw row/column summaries |
+| `wide_residual` | GroupNorm pre-activation wide/grouped residual anchor |
+| `dense_reuse` | compact DenseNet-style feature reuse |
 
-Spatial, Spatial Pyramid und Factorized sind standardmäßig aktiv. Die
-Axis-Familien werden anhand der Hypothesen aktiviert. Dadurch bleibt das
-Portfolio auf gewöhnlichen Bildern kompakt und wird bei strukturierten Inputs
-gezielt breiter.
+Axis encoders add absolute sinusoidal position features and keep multiple
+ordered bins. Semantic families have only three calibrated anchor
+specifications rather than the full residual Cartesian grid. This adds
+different inductive biases without consuming hundreds of near-duplicate
+slots. Exact module parameter counts are used for semantic anchors; the legacy
+families retain their tested analytical counts.
 
-GroupNorm in factorisierten und Axis-Modellen reduziert die Abhängigkeit von
-unbekannten oder OOM-bedingt verkleinerten Batchgrößen. Alle Kandidaten sind
-eigenständige `nn.Module`-Objekte. Parameterzahlen werden analytisch berechnet.
+## 5. Validation and search measurements
 
-## 7. Trainingsrezepte
+Validation is sampled in original class proportions, not balanced by
+resampling. NAS tracks ordinary accuracy as the competition objective and
+balanced accuracy as a separate diagnostic.
 
-Hinweis: Die unten noch beschriebene gemeinsame Auswahl ist historisch. Aktiv
-ist die oben dokumentierte Trennung aus neutralem Architekturvergleich und
-anschliessendem, Incumbent-sicherem Recipe-Rennen auf identischen
-Checkpoint-Klonen.
+The byte-bounded validation cache is deterministically split into:
 
-Architecture Search und Trainingspolicy werden in einem kleinen,
-kontrollierten Produktraum gemeinsam gewählt:
+- a 75% selection subset used by adaptive search decisions;
+- a disjoint 25% confirmation subset used for finalist and recipe acceptance.
 
-| Rezept | Eigenschaften |
-|---|---|
-| `stable` | AdamW, mittleres Weight Decay, wenig Smoothing |
-| `regularized` | mehr Weight Decay/Smoothing, vorsichtiges MixUp |
-| `balanced` | geglättete Class Weights bei erkennbarer Imbalance |
-| `fast_fit` | etwas höhere LR und weniger Regularisierung bei vielen Daten |
+The default maximum is 4,096 examples and 64 MiB. Tiny splits safely fall back
+to one selection set.
 
-Es werden nie alle denkbaren Hyperparameter kombiniert. Je nach
-Klassenverteilung sind höchstens drei Rezepte aktiv. Das hält den Search
-berechenbar und vermeidet dataset-spezifisches Tuning.
+Candidate state records unsmoothed cross-entropy, accuracy, balanced accuracy,
+top-two probability margin, examples seen, progressive data cursor, seed
+schedule, final learning rate, elapsed time, examples/second, and CUDA peak
+allocation. Accuracy remains the dominant ranking signal. Loss slope,
+uncertainty, train/validation gap, and efficiency are bounded near-tie terms.
 
-Das gewählte Rezept wird am Gewinnermodell gespeichert und vom separaten
-`Trainer` übernommen.
+## 6. Hierarchical NAS controller
 
-## 8. Hierarchischer Multi-Fidelity-Controller
+### 6.1 Time tiers
 
-### 8.1 Zeit-Tiers
-
-| Tier | Zeit | Search |
+| Tier | Remaining time | Controller |
 |---|---:|---|
-| 1 | mindestens 15 Minuten | 54 Pre-Screen-Kandidaten, 12 labelbasierte Finalisten |
-| 2 | 5 bis 15 Minuten | 30 Pre-Screen-Kandidaten, 7 Finalisten |
-| 3 | unter 5 Minuten | direkter Portfolio-Anker |
+| 1 | at least 15 minutes | 54 proxy candidates, family probes, 12 macro finalists |
+| 2 | 5–15 minutes | 30 proxy candidates, 7 macro finalists |
+| 3 | under 5 minutes | direct robust anchor |
 
-Tier 1 darf höchstens 18 Prozent beziehungsweise 360 Sekunden verbrauchen.
-Tier 2 darf höchstens 12 Prozent beziehungsweise 120 Sekunden verbrauchen.
-Eine harte Restzeitgrenze schützt finales Training und Prediction.
+Tier 2 protects final training after at most 12% or 120 seconds of search.
+Tier 1 uses 22% of the remaining time with a scalable cap: at least the former
+360-second ceiling is available on long runs, and the cap grows to at most
+1,800 seconds on multi-hour runs. Every phase also checks the protected
+remaining-time deadline.
 
-### 8.2 Portfolio-Anker und Sampling
+### 6.2 Proxy pre-screen
 
-Aktiv sind drei Groessenanker pro Familie und Groessenstrata in den Quoten;
-die folgende Beschreibung der Recipe-Rotation ist historisch.
+SynFlow, Jacobian correlation, NASWOT, and measured proxy latency only order
+or reduce the initial pool. Proxy values do not enter later label-based
+utility. Deterministic family anchors are considered first, and sampling spans
+family and parameter-size strata.
 
-Jede aktive Familie erhält zuerst einen deterministischen, mittelgroßen
-Sicherheitsanker. Weitere Spezifikationen werden familienbalanciert und über
-Größenquartile gezogen. Kandidaten sind duplikatfrei.
+### 6.3 Representation probe race
 
-Vor der ersten Fidelity-Runde werden die verfügbaren Plätze explizit
-gleichmäßig auf die im Proxy-Screen erreichten Familien verteilt. Bei drei
-Familien und zwölf Plätzen erhält jede vier Kandidaten; bei sechs Familien
-erhält jede zwei. Nur wenn eine Familie ihr Kontingent wegen Parameter- oder
-Laufzeitfiltern nicht füllen kann, werden Restplätze global nach Proxy-Rang
-vergeben.
+Before macro dimensions compete, one compact anchor from every represented
+family is evaluated untrained and receives an equal progressive training
+segment. Accuracy, validation loss improvement, uncertainty, and
+train/validation gap determine promotion. The best two families advance; a
+third advances when its uncertainty interval overlaps. Promoted probes receive
+a second equal segment on new data positions.
 
-Die Trainingsrezepte rotieren innerhalb jeder Familie unabhängig. Dadurch ist
-beispielsweise Spatial nicht fest mit `stable` und Factorized nicht fest mit
-`regularized` gekoppelt. Wenn das Familienkontingent groß genug ist, erreicht
-jede Familie die labelbasierte Runde unter mehreren Rezepten.
+Only macro candidates from promoted families enter successive halving. If the
+clock or evidence is insufficient, all represented families remain eligible.
 
-Parametergrenzen dienen ausschließlich der Machbarkeit. Die Competition
-bestraft Parameterzahl nicht direkt; sie ist daher kein Accuracy-Proxy.
+### 6.4 Macro architecture race
 
-### 8.3 Rolle der Zero-Cost-Proxies
+The train cache is capped at 128 MiB and one epoch. Its first batch is sliced
+if necessary, so even an oversized first batch cannot exceed the ceiling.
+CUDA performs one compact calibration update before the race. Logical batches
+are retained while OOM recursively halves a reusable microbatch and accumulates
+gradients.
 
-Aktiv ist der Proxy ausschliesslich im Pre-Screen. Ab dem labelbasierten
-Training besitzt er keinen Utility-Tie-Break mehr.
+Successive-halving survivors retain optimizer state and use a progressive data
+cursor instead of replaying the start of a cache. Finalists then receive equal
+deterministic full-data passes while they still improve and the recipe reserve
+is safe.
 
-SynFlow, Jacobian-Correlation und NASWOT sehen denselben Calibration-Batch.
-Gemessene Proxy-Latenz wird als weiteres schwaches Signal verwendet.
+The last architectures are compared on both validation splits. Confirmation
+accuracy receives 80% of the robust score; selection accuracy and earlier rank
+stability are smaller terms. When confirmation accuracies overlap within a
+bounded sampling interval, confirmation loss resolves the tie.
 
-Die Proxies sind nur ein Pre-Screen. Vor dem labelbasierten Training stellt der
-Controller sicher, dass:
+The runner-up specification is always recorded. Its CPU checkpoint is retained
+only for a statistical tie. It is stored in a dormant plain Python bundle, so
+it is not a registered branch, does not change the returned model's parameter
+count or forward pass, and cannot act as an ensemble.
 
-- jede im Pre-Screen erreichte Modellfamilie vertreten ist,
-- jedes aktive Trainingsrezept vertreten ist,
-- übrige Plätze nach Proxy-Rang aufgefüllt werden.
+## 7. Recipe and optimizer race
 
-Damit kann ein Proxy-Bias keine vollständige Repräsentationsfamilie mehr
-eliminieren.
+Architecture comparison uses one neutral zero-smoothing AdamW probe. After an
+architecture wins, byte-identical checkpoint clones enter an incumbent-safe
+two-stage recipe race:
 
-### 8.4 Labelbasierte Fidelity-Runden
+| Recipe | Main distinction |
+|---|---|
+| `stable` | AdamW, zero smoothing, reduced dropout |
+| `regularized` | AdamW, stronger decay/smoothing/dropout and optional MixUp |
+| `balanced` | AdamW with class weights when imbalance is material |
+| `fast_fit` | AdamW with higher LR and reduced regularization on large datasets |
+| `sgd_nesterov` | SGD, momentum 0.9, Nesterov, cosine decay, zero smoothing |
 
-Aktiv sind erhaltene AdamW-Zustaende, adaptive faire Full-Data-Paesse und die
-robuste Kombination aus Full Validation, vorheriger Fidelity und Rangstabilitaet.
-Der unten genannte feste Drei-Pass-Deckel ist historisch.
+Only `balanced` or `fast_fit` is added for the applicable condition, so a run
+normally races three or four recipes.
 
-Bis zu 128 Trainingsbatches beziehungsweise 128 MiB werden einmal
-materialisiert. Alle Kandidaten sehen exakt dieselben Daten.
+All recipes receive the same stage-one work, data order, and seed. The best
+two receive equal stage-two work. Promotion uses best accuracy plus bounded
+loss slope and train/validation-gap terms. Each trial restores its best
+evaluated stage and matching optimizer state.
 
-Pro Runde erhält jeder Kandidat:
+A trial must improve selection accuracy by at least
+`max(0.001, 1/N_selection)` and independently improve confirmation accuracy by
+its sampling margin. Otherwise the unchanged architecture incumbent and its
+optimizer state are returned.
 
-- eine maximale Datenabdeckung,
-- zusätzlich ein gleiches Wall-Clock-Quantum,
-- dieselbe klassenbalancierte Validation-Teilmenge.
+## 8. Final anytime trainer
 
-Langsame Kandidaten erhalten damit nicht unbegrenzt mehr Suchzeit, schnelle
-Kandidaten können im gleichen Quantum mehr Updates durchführen. Utility
-kombiniert:
+The trainer benchmarks real train and validation steps before optimization.
+The prediction reserve is:
 
-- Accuracy,
-- bei Imbalance einen kleinen Balanced-Accuracy-Anteil,
-- Learning-Curve-Gewinn,
-- gemessene Schrittzeit und projizierte finale Epochen,
-- Proxy-Rang nur als sehr kleinen Tie-Breaker.
+`max(20 seconds, 1.75 * measured_prediction_time + 15 seconds)`
 
-Die letzten beiden Kandidaten werden auf derselben vollständigen Validation
-verglichen. Teilmengen- und Full-Validation-Werte werden nicht direkt
-gegeneinander gerankt. Das Gewinnermodell behält seine Gewichte.
+and includes every enabled test-time view. It has no arbitrary 180-second cap.
+The hard epoch ceiling is 100,000 and exists only as protection against a
+broken synthetic clock; the supplied competition clock is the normal stop.
 
-Vor diesem Vergleich wird die nach den breiten Fidelity-Runden noch freie
-Search-Zeit auf beide Finalisten gleich verteilt. Sie trainieren in derselben
-deterministischen Reihenfolge auf dem vollständigen Trainingssatz statt auf
-dem Cache. Pro Kandidat sind höchstens drei zusätzliche vollständige
-Durchläufe erlaubt; die Wall-Clock-Grenze bleibt vorrangig. Dadurch erhöht die
-Finalrunde Datenabdeckung und Warm-Start-Qualität, ohne das geschützte finale
-Trainingsbudget anzutasten.
+AdamW recipes use validation-driven `ReduceLROnPlateau`. SGD uses Nesterov and
+cosine decay. Both paths use warmup, AMP on CUDA, gradient clipping, and a
+monotonic wall-clock cooldown ceiling.
 
-### 8.5 Incumbent-sicheres Recipe-Rennen
+The ordered anytime queue is:
 
-Nach der Architekturwahl wird ihr gemeinsames Checkpoint auf genau der
-Validation-Quelle bewertet, die auch fuer alle Recipe-Trials gilt. Diese
-Messung liefert Accuracy, Balanced Accuracy und eine recipe-neutrale
-Cross-Entropy-Loss.
+1. continue the NAS-selected recipe and preserve its warm start;
+2. run every untried recipe/optimizer from the common NAS checkpoint with a
+   new deterministic seed;
+3. when retained, train the tied second architecture as a single challenger;
+4. restart from the immutable global-best model with progressively smaller
+   learning rates and fresh seeds while another full epoch is safe;
+5. evaluate the current attempt's EMA and the top three same-architecture
+   checkpoint average if a complete validation pass still fits.
 
-Das Rennen besitzt zwei Stufen:
+The global best validation checkpoint never regresses. If a different
+architecture wins, Trainer returns it and updates the model used by
+`predict()`.
 
-1. Jedes aktive Recipe startet vom byte-identischen Architektur-Checkpoint
-   ohne uebernommenen Optimizer-State und erhaelt dieselbe Schrittzahl,
-   Datenreihenfolge und denselben Seed.
-2. Die zwei besten Trials werden anhand ihrer bisher besten Accuracy plus
-   einer kleinen, begrenzten Validation-Loss-Steigung promoviert. Beide
-   erhalten wieder dieselbe Schrittzahl und denselben Stufen-Seed.
+EMA runs during every attempt. Test-time augmentation is enabled only when the
+functional augmentation probe selected `safe_flips`; prediction averages the
+original logits and only the verified horizontal/vertical views.
 
-Jeder Trial schuetzt sein bestes an einer Stufengrenze bewertetes Modell. Sinkt
-die Accuracy in Stufe zwei, werden Gewichte und Optimizer-State aus der
-besseren Stufe wiederhergestellt. Ein Recipe darf den Incumbent nur ersetzen,
-wenn seine beste Accuracy den Incumbent um mindestens `max(0.001, 1/N_valid)`
-uebertrifft. Kann nicht jedes Recipe Stufe eins oder koennen nicht zwei Recipes
-Stufe zwei fair abschliessen, bleibt der Incumbent erhalten.
+## 9. Failure behavior
 
-Der an den finalen Trainer uebergebene AdamW-State gehoert dadurch immer exakt
-zum zurueckgegebenen Checkpoint. Bei Incumbent-Fallback wird dessen
-Architektur-Optimizer-State beibehalten. Die unabhaengigen Trainer-Retries
-starten weiterhin vom gemeinsamen NAS-Checkpoint.
+- Search and validation materialization are byte bounded.
+- CUDA search OOM halves the microbatch and retries the same logical batch.
+- A candidate is rejected only if a one-example microbatch still fails.
+- Calibration OOM rebuilds final loaders at half batch size.
+- In-epoch OOM preserves the global best and can reduce the loader.
+- Prediction OOM recursively splits a batch while preserving order.
+- Missing/failed proxy values cannot terminate the whole pipeline.
 
-## 9. Finaler Trainer
+## 10. Rule-gated and empirical items intentionally disabled
 
-### 9.1 Durchsatz und Zeitreserve
+- A complementary-model ensemble remains disabled until organizers explicitly
+  confirm it is allowed. `metadata["nas_ensemble"]` is always `False`.
+- Train-plus-validation refit remains disabled until leave-one-dataset-out
+  experiments show that losing the stopping holdout is beneficial.
+- No test-label adaptation, codename routing, downloaded hidden-data logic, or
+  external pretrained weights are present.
 
-Vor dem Training misst der Trainer reale Train- und Validation-Schrittzeiten.
-Aus der exakten Zahl der Testbatches wird eine Prediction-Reserve zwischen 30
-und 180 Sekunden abgeleitet. Vor jeder Epoche und periodisch innerhalb einer
-Epoche wird die Competition-Clock geprüft.
+## 11. Local verification
 
-### 9.2 Optimierung
+The current regression suite covers:
 
-- AdamW mit dem gewählten Rezept,
-- batchgrößenabhängige Base-LR,
-- Label Smoothing zwischen 0,03 und 0,10,
-- optional MixUp oder Class Weights,
-- AMP auf CUDA,
-- Gradient Clipping bei Norm 5.
+- all legacy and semantic family activations, forward shapes, and exact
+  parameter counts;
+- source-dtype preservation, streaming statistics, train/validation byte caps,
+  disjoint prior-preserving confirmation, and logical microbatch accumulation;
+- incumbent preservation, staged recipe fairness, loss/gap/confirmation
+  objectives, and optimizer-state ownership;
+- SGD/Nesterov/cosine construction, incompatible-state rejection, EMA/state
+  helpers, safe-flip TTA, and dormant challenger registration;
+- an accelerated Tier-1 end-to-end flow through processing, NAS, anytime
+  training, and complete ordered prediction.
 
-### 9.3 Learning-Rate-Steuerung
-
-Die folgende Fine-Tuning-Restart-Beschreibung ist historisch. Aktiv sind
-unabhaengige Versuche vom gemeinsamen NAS-Checkpoint mit neuer Recipe, neuem
-Seed und neuem Optimizer; das global beste Checkpoint bleibt geschuetzt.
-
-Nach einem kurzen linearen Warmup steuert
-`ReduceLROnPlateau` die Learning Rate. Plateaus führen zuerst zu echten
-LR-Absenkungen; sie beenden das Training nicht bei hoher LR.
-
-Parallel begrenzt ein monoton fallender, wall-clock-basierter Cosine-Cap die
-maximal zulässige LR. Selbst bei ständig leicht steigender Validation gelangt
-das Training dadurch vor Ablauf des Budgets in eine Fine-Tuning-Phase. Ein
-später neu geschätzter Epochenhorizont kann die LR nicht wieder erhöhen.
-
-Erreicht der erste Optimierungsversuch nach mindestens zehn Epochen ohne
-Verbesserung den LR-Floor, wird genau einmal das beste Checkpoint geladen.
-Optimizer-Momente werden verworfen, Weight Decay halbiert und ein
-kontrollierter Fine-Tuning-Versuch mit höchstens acht Prozent der Base-LR
-gestartet. Dieser protokollierte Neustart darf die LR einmalig anheben, bleibt
-aber unter dem wall-clock-basierten Cap. Erreicht auch der zweite Versuch den
-Floor ohne Verbesserung, endet das Training früh. Das beste Validation-
-Checkpoint schützt in beiden Fällen vor Regression.
-
-### 9.4 OOM-Verhalten
-
-- OOM-Kandidaten werden im Search verworfen.
-- OOM während der Trainer-Kalibrierung halbiert die Batchgröße bis mindestens
-  vier.
-- Ein später OOM kann ebenfalls einen kleineren Loader auslösen.
-- Prediction-Batches werden bei OOM rekursiv geteilt.
-
-Ein ungewöhnlich großes verborgenes Dataset soll dadurch schlechter, aber
-nicht vollständig fehlschlagen.
-
-## 10. Sicherheitsinvarianten
-
-1. Keine Entscheidung verwendet den Dataset-Codenamen.
-2. NAS gibt genau ein PyTorch-Modell zurück.
-3. Es gibt kein finales Ensemble, DARTS, einspace oder Supernet.
-4. Testdaten werden vollständig und in fester Reihenfolge vorhergesagt.
-5. Search- und Prediction-Zeit sind explizit geschützt.
-6. Jede aktive Familie erhält nach Möglichkeit labelbasierte Evidenz.
-7. Full Validation entscheidet nur gegen Full Validation.
-8. Das beste Checkpoint wird vor Prediction wiederhergestellt.
-9. Kein Recipe-Trial darf ein staerkeres gemeinsames Architektur-Checkpoint
-   ersetzen; Modell- und Optimizer-State werden als zusammengehoeriges Paar
-   uebergeben.
-10. LR steigt innerhalb eines Optimierungsversuchs nicht wieder an; erlaubt ist
-   ausschließlich der einmalige protokollierte Fine-Tuning-Neustart vom besten
-   Checkpoint.
-11. Fehlende Proxywerte oder einzelne OOM-Kandidaten stoppen nicht die
-    gesamte Pipeline.
-
-## 11. Validierung
-
-Lokal geprüft:
-
-- Python-Syntax aller Submission-Dateien,
-- Zeilen- und Spalten-One-Hot-Fingerprints,
-- Aktivierung der passenden Axis-Hypothesen,
-- Portfolio-Größe auf natürlichen und strukturierten Inputs,
-- exakte analytische Parameterzahl für 36 Kombinationen über alle sechs
-  Modellfamilien,
-- Incumbent-Erhalt gegen schwächere Recipe-Trials,
-- identische Recipe-Startgewichte, Seeds und Stufen-Schrittzahlen,
-- zweistufige Promotion mit Validation-Loss-Steigung,
-- Wiederherstellung des besten Recipe-Stufen-Checkpoints samt passendem
-  Optimizer-State,
-- sicherer Incumbent-Fallback bei kurzem Budget,
-- unveränderte Competition-API,
-- Archivstruktur ohne Evaluator oder Testdateien.
-
-Ein vollständiger Accuracy- und CUDA-Lauf bleibt in Colab beziehungsweise der
-Competition-Umgebung erforderlich. Die Miniconda-Installation enthält CPU-
-PyTorch für lokale Regressionstests, aber die Competition-CUDA-Umgebung wurde
-hier nicht ausgeführt.
-
-## 12. Offene empirische Kalibrierung
-
-Die folgenden Werte sind robuste Startpunkte und müssen mit mehreren Seeds
-auf historischen Datasets überprüft werden:
-
-- Hypothesen-Schwellen für Axis-Familien,
-- Anteil des Search-Budgets,
-- Zahl der labelbasierten Finalisten,
-- MixUp-Stärke,
-- Gewichte der Utility-Komponenten,
-- Plateau-Patience und LR-Reduktionsfaktor.
-
-Die relevante Auswertung ist Leave-one-Dataset-out: Regeln werden auf mehreren
-historischen Datasets gewählt und jeweils auf einem nicht zur Auswahl
-verwendeten Dataset bewertet. Optimiert werden Median, Worst Case und
-Fehlerrate, nicht der Codename eines einzelnen Tests.
-
-## 13. Änderungsprotokoll
-
-### 30. Juli 2026 - Incumbent-sicheres zweistufiges Recipe-Rennen
-
-- Architektur-Checkpoint als expliziten Incumbent auf derselben
-  Validation-Quelle wie alle Recipes eingeführt.
-- Recipe-neutrale Validation-Cross-Entropy und begrenzte Loss-Steigung als
-  Nahbereichssignal ergänzt.
-- Faire erste Stufe für alle Recipes und zweite Stufe für zwei Promovierte
-  eingeführt.
-- Bestes bewertetes Stufen-Checkpoint sowie passendes AdamW-State pro Trial
-  geschützt.
-- Mindestverbesserung von 0,10 Prozentpunkten beziehungsweise einem
-  Validation-Beispiel vor Incumbent-Ersatz eingeführt.
-- Kurze oder unvollständige Rennen fallen ohne Gewichtsregression auf den
-  Incumbent zurück.
-
-### 30. Juli 2026 - Controller-Nachschärfung nach Teilrun
-
-- Gleichmäßige Familienquoten für die erste labelbasierte Runde eingeführt.
-- Trainingsrezepte innerhalb jeder Familie unabhängig rotiert.
-- Ungenutzte Search-Zeit in eine faire Full-Data-Finalistenrunde investiert.
-- Einmaligen Fine-Tuning-Neustart vom besten Checkpoint ergänzt.
-- Erfolgsloses zweites Low-LR-Plateau beendet Training früh.
-
-### 30. Juli 2026 - Hierarchisches Portfolio
-
-- Boolesches Routing durch mehrere Repräsentationshypothesen ersetzt.
-- One-Hot-Struktur auf beiden Achsen ergänzt.
-- Spatial-Pyramid-, Factorized-, Height-Axis- und Dual-Axis-Familien ergänzt.
-- GroupNorm für factorisierte und achsenorientierte Modelle eingeführt.
-- Architecture/Recipe-Suche mit Stable-, Regularized-, Balanced- und
-  Fast-Fit-Rezepten ergänzt.
-- Zero-Cost-Proxies auf Pre-Screen/Tie-Break beschränkt.
-- Familien- und Rezeptabdeckung vor labelbasiertem Halving garantiert.
-- Gleiche Wall-Clock-Quanten und stabilen Validation-Vergleich eingeführt.
-- Search-Budget auf maximal 18 Prozent erhöht.
-- Cosine-Horizon/Early-Stopping durch Plateau-Scheduler plus monotonen
-  Zeit-Cooldown ersetzt.
-- Class Weights, MixUp und OOM-Fallback integriert.
-
-### 30. Juli 2026 - Vorherige Compute-Korrekturen
-
-- Duplikatfreies Sampling und feste Calibration-Batches.
-- Korrigierte Proxy-Implementierungen.
-- Warm-Start des Search-Gewinners.
-- Reale Durchsatzmessung und Prediction-Reserve.
-- AMP, Gradient Clipping und bestes Validation-Checkpoint.
+CPU tests pass locally. The original three datasets and a CUDA GPU are not
+available in this workspace, so multi-seed historical accuracy and real CUDA
+peak-memory comparisons remain required before submission.

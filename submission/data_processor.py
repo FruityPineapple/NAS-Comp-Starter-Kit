@@ -361,7 +361,9 @@ class DataProcessor:
         self.metadata["normalization_chunk_samples"] = chunk_samples
         return mean.tolist(), std.tolist()
 
-    def _estimate_distribution_shift(self, max_samples=256):
+    def _estimate_distribution_shift(
+        self, max_samples=256, max_megabytes=32
+    ):
         """Compare train/validation channel moments without fitting a model."""
         if len(self.valid_x) == 0 or len(self.train_x) == 0:
             return {
@@ -370,29 +372,102 @@ class DataProcessor:
             }
 
         def moments(values):
-            count = min(len(values), int(max_samples))
+            sample_elements = int(np.prod(values.shape[1:]))
+            byte_limited = max(
+                1,
+                int(max_megabytes * 1024 * 1024)
+                // max(1, 4 * sample_elements),
+            )
+            count = min(
+                len(values), int(max_samples), int(byte_limited)
+            )
             indices = np.linspace(
                 0, len(values) - 1, count, dtype=np.int64
             )
             sample = np.asarray(values[indices], dtype=np.float32)
             if sample.ndim == 3:
                 sample = sample[:, np.newaxis, :, :]
+            channel_means = sample.mean(axis=(2, 3), dtype=np.float64)
+            channel_stds = sample.std(axis=(2, 3), dtype=np.float64)
+            top = sample[:, :, : max(1, sample.shape[2] // 2), :].mean(
+                axis=(2, 3), dtype=np.float64
+            )
+            bottom = sample[
+                :, :, sample.shape[2] // 2 :, :
+            ].mean(axis=(2, 3), dtype=np.float64)
+            left = sample[:, :, :, : max(1, sample.shape[3] // 2)].mean(
+                axis=(2, 3), dtype=np.float64
+            )
+            right = sample[
+                :, :, :, sample.shape[3] // 2 :
+            ].mean(axis=(2, 3), dtype=np.float64)
+            features = np.concatenate(
+                [channel_means, channel_stds, top, bottom, left, right],
+                axis=1,
+            )
             return (
                 sample.mean(axis=(0, 2, 3), dtype=np.float64),
                 sample.std(axis=(0, 2, 3), dtype=np.float64),
+                features,
             )
 
-        train_mean, train_std = moments(self.train_x)
-        valid_mean, valid_std = moments(self.valid_x)
+        train_mean, train_std, train_features = moments(self.train_x)
+        valid_mean, valid_std, valid_features = moments(self.valid_x)
         scale = np.maximum(0.5 * (train_std + valid_std), 1e-4)
         mean_shift = float(np.mean(np.abs(train_mean - valid_mean) / scale))
         std_shift = float(
             np.mean(np.abs(train_std - valid_std) / np.maximum(scale, 1e-4))
         )
-        score = mean_shift + 0.5 * std_shift
+        common = min(len(train_features), len(valid_features))
+        if common >= 4:
+            train_features = train_features[:common]
+            valid_features = valid_features[:common]
+            fit = np.arange(common) % 2 == 0
+            evaluate = ~fit
+            fit_features = np.concatenate(
+                [train_features[fit], valid_features[fit]], axis=0
+            )
+            center = fit_features.mean(axis=0)
+            feature_scale = np.maximum(
+                fit_features.std(axis=0), 1e-6
+            )
+            train_scaled = (train_features - center) / feature_scale
+            valid_scaled = (valid_features - center) / feature_scale
+            train_center = train_scaled[fit].mean(axis=0)
+            valid_center = valid_scaled[fit].mean(axis=0)
+
+            def predicts_valid(features):
+                train_distance = np.square(
+                    features - train_center
+                ).mean(axis=1)
+                valid_distance = np.square(
+                    features - valid_center
+                ).mean(axis=1)
+                return valid_distance < train_distance
+
+            train_correct = np.mean(
+                ~predicts_valid(train_scaled[evaluate])
+            )
+            valid_correct = np.mean(
+                predicts_valid(valid_scaled[evaluate])
+            )
+            domain_accuracy = float(
+                0.5 * (train_correct + valid_correct)
+            )
+        else:
+            domain_accuracy = 0.5
+        domain_confidence = max(
+            0.0, min(1.0, 2.0 * (domain_accuracy - 0.5))
+        )
+        score = (
+            mean_shift
+            + 0.5 * std_shift
+            + 0.35 * domain_confidence
+        )
         return {
             "distribution_shift_score": score,
             "distribution_shift_detected": bool(score >= 0.75),
+            "domain_probe_accuracy": domain_accuracy,
         }
 
     def _estimate_flip_safety(self, data_props):
@@ -408,9 +483,14 @@ class DataProcessor:
         ) < 12:
             return False, False
 
-        sample_count = min(len(self.train_x), 768)
+        sample_elements = int(np.prod(self.train_x.shape[1:]))
+        byte_limited = max(
+            1, int(32 * 1024 * 1024) // max(1, 4 * sample_elements)
+        )
+        sample_count = min(len(self.train_x), 768, byte_limited)
         if sample_count < max(32, 2 * int(self.metadata["num_classes"])):
-            return (not data_props.get("is_structured", False)), False
+            # Insufficient evidence must never be interpreted as flip safety.
+            return False, False
 
         indices = np.linspace(
             0, len(self.train_x) - 1, sample_count, dtype=np.int64
@@ -537,11 +617,13 @@ class DataProcessor:
             )
         )
         print(
-            "    - Train/validation shift: {:.3f}{}".format(
+            "    - Train/validation shift: {:.3f}{} "
+            "(domain probe {:.1f}%)".format(
                 props.get("distribution_shift_score", 0.0),
                 " (detected)"
                 if props.get("distribution_shift_detected", False)
                 else "",
+                100.0 * props.get("domain_probe_accuracy", 0.5),
             )
         )
         print("    - Num classes: {}".format(self.metadata["num_classes"]))

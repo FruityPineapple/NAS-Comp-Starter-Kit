@@ -1,5 +1,6 @@
 """Measured, recipe-aware final training with strict wall-clock protection."""
 
+import copy
 import math
 import statistics
 import time
@@ -29,7 +30,9 @@ class Trainer:
         self.metadata = metadata
         self.clock = clock
         self.use_amp = device.type == "cuda"
-        self.max_epochs = 400
+        # The external clock is the real termination condition.  This only
+        # protects against a broken/constant clock in a synthetic harness.
+        self.max_epochs = 100_000
         self.grad_clip_norm = 5.0
 
         self.recipe = dict(
@@ -65,6 +68,16 @@ class Trainer:
             delattr(model, "independent_retry_state")
         if hasattr(model, "alternative_training_recipes"):
             delattr(model, "alternative_training_recipes")
+        challenger_bundle = getattr(
+            model, "architecture_challenger_bundle", {}
+        )
+        if hasattr(model, "architecture_challenger_bundle"):
+            delattr(model, "architecture_challenger_bundle")
+        self.challenger_model = challenger_bundle.get("model")
+        self.challenger_spec = challenger_bundle.get("spec")
+        self.challenger_val_acc = float(
+            challenger_bundle.get("val_acc", 0.0)
+        )
         self.benchmark = (
             float(metadata["benchmark"])
             if metadata.get("benchmark") is not None
@@ -93,6 +106,13 @@ class Trainer:
         self.training_time_budget = 1.0
         self.attempt_time_budget = 1.0
         self.plateau_patience = 3
+        props = metadata.get("data_props", {})
+        self.tta_dimensions = []
+        if metadata.get("augmentation_policy") == "safe_flips":
+            if props.get("horizontal_flip_safe", False):
+                self.tta_dimensions.append(-1)
+            if props.get("vertical_flip_safe", False):
+                self.tta_dimensions.append(-2)
 
     def _apply_recipe(self, recipe):
         self.recipe = dict(recipe)
@@ -108,6 +128,17 @@ class Trainer:
         )
         self.mixup_alpha = float(self.recipe.get("mixup_alpha", 0.0))
 
+    def _apply_model_regularization(self, model):
+        scale = float(self.recipe.get("dropout_scale", 1.0))
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                if not hasattr(module, "_nas_base_dropout"):
+                    module._nas_base_dropout = float(module.p)
+                module.p = min(
+                    0.60,
+                    max(0.0, module._nas_base_dropout * scale),
+                )
+
     def _criterion(self):
         return nn.CrossEntropyLoss(
             weight=self._class_weights(),
@@ -120,7 +151,12 @@ class Trainer:
         excluded = set(excluded or ())
         current = self.recipe.get("name")
         if current == "regularized":
-            for name in ("fast_fit", "stable", "balanced"):
+            for name in (
+                "sgd_nesterov",
+                "fast_fit",
+                "stable",
+                "balanced",
+            ):
                 for recipe in self.alternative_recipes:
                     if (
                         recipe.get("name") == name
@@ -148,6 +184,15 @@ class Trainer:
         return "out of memory" in message or "cuda error: memory" in message
 
     def _base_lr_for_batch(self, batch_size):
+        if str(self.recipe.get("optimizer", "adamw")).lower() == "sgd":
+            reference = float(self.recipe.get("final_lr", 2e-2))
+            batch_scaled_lr = reference * math.sqrt(
+                float(batch_size) / 128.0
+            )
+            return float(
+                max(5e-3, min(1.5e-1, batch_scaled_lr))
+                * float(self.recipe.get("lr_scale", 1.0))
+            )
         batch_scaled_lr = 1e-3 * math.sqrt(float(batch_size) / 128.0)
         return float(
             max(3e-4, min(2.5e-3, batch_scaled_lr))
@@ -315,10 +360,13 @@ class Trainer:
             )
         )
         test_batches = max(recorded_test_batches, effective_test_batches)
-        predicted_test_time = valid_step * max(1, test_batches)
+        prediction_views = 1 + len(self.tta_dimensions)
+        predicted_test_time = (
+            valid_step * max(1, test_batches) * prediction_views
+        )
         self.prediction_reserve = max(
-            30.0,
-            min(180.0, predicted_test_time * 1.75 + 15.0),
+            20.0,
+            predicted_test_time * 1.75 + 15.0,
         )
         self.training_time_budget = max(
             0.0, self.clock.check() - self.prediction_reserve
@@ -358,6 +406,7 @@ class Trainer:
         self.metadata["trainer_prediction_reserve"] = (
             self.prediction_reserve
         )
+        self.metadata["trainer_prediction_views"] = prediction_views
         print(
             "  [Trainer] Estimated epoch: {}, prediction reserve: {}, "
             "safe horizon: {} epochs".format(
@@ -400,20 +449,60 @@ class Trainer:
     def _make_optimizer_and_scheduler(
         self, model, optimizer_state=None
     ):
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=self.base_lr * 0.10,
-            weight_decay=self.weight_decay,
-        )
+        optimizer_name = str(
+            self.recipe.get("optimizer", "adamw")
+        ).lower()
+        if optimizer_name == "sgd":
+            optimizer = optim.SGD(
+                model.parameters(),
+                lr=self.base_lr * 0.10,
+                momentum=float(self.recipe.get("momentum", 0.9)),
+                nesterov=bool(self.recipe.get("nesterov", True)),
+                weight_decay=self.weight_decay,
+            )
+        else:
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=self.base_lr * 0.10,
+                weight_decay=self.weight_decay,
+            )
         if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
-            for group in optimizer.param_groups:
-                group["lr"] = min(
-                    self.base_lr, float(group.get("lr", self.base_lr))
-                )
-                group["weight_decay"] = self.weight_decay
-        scheduler = self._make_plateau_scheduler(optimizer)
+            groups = optimizer_state.get("param_groups", [])
+            group = groups[0] if groups else {}
+            compatible = (
+                ("momentum" in group and "betas" not in group)
+                if optimizer_name == "sgd"
+                else ("betas" in group)
+            )
+            try:
+                if not compatible:
+                    raise ValueError("incompatible optimizer state")
+                optimizer.load_state_dict(optimizer_state)
+            except (KeyError, ValueError):
+                # An incumbent architecture checkpoint can carry AdamW search
+                # moments while a different final optimizer won the recipe
+                # policy. Weights remain valid; incompatible moments do not.
+                optimizer_state = None
+            if optimizer_state is not None:
+                for group in optimizer.param_groups:
+                    group["lr"] = self.base_lr * 0.10
+                    group["weight_decay"] = self.weight_decay
+        if str(self.recipe.get("scheduler", "plateau")).lower() == "cosine":
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, int(self.safe_epochs)),
+                eta_min=self.base_lr * 0.01,
+            )
+        else:
+            scheduler = self._make_plateau_scheduler(optimizer)
         return optimizer, scheduler
+
+    @staticmethod
+    def _step_scheduler(scheduler, validation_accuracy):
+        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(validation_accuracy)
+        else:
+            scheduler.step()
 
     def _set_warmup_lr(self, optimizer, global_step):
         progress = min(1.0, global_step / max(1, self.warmup_steps))
@@ -436,6 +525,51 @@ class Trainer:
         for group in optimizer.param_groups:
             group["lr"] = min(group["lr"], ceiling)
 
+    @staticmethod
+    def _cpu_state_dict(model):
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+
+    @staticmethod
+    def _update_ema_state(ema_state, model, decay=0.995):
+        current = model.state_dict()
+        with torch.no_grad():
+            for key, value in current.items():
+                cpu_value = value.detach().cpu()
+                if key not in ema_state or not torch.is_floating_point(
+                    cpu_value
+                ):
+                    ema_state[key] = cpu_value.clone()
+                else:
+                    ema_state[key].mul_(decay).add_(
+                        cpu_value, alpha=1.0 - decay
+                    )
+
+    @staticmethod
+    def _average_states(states, reference):
+        if not states:
+            return reference
+        averaged = {}
+        for key, reference_value in reference.items():
+            if torch.is_floating_point(reference_value):
+                averaged[key] = torch.stack(
+                    [state[key].float() for state in states], dim=0
+                ).mean(dim=0).to(dtype=reference_value.dtype)
+            else:
+                averaged[key] = reference_value.clone()
+        return averaged
+
+    def _evaluate_state(self, model, candidate_state):
+        original = self._cpu_state_dict(model)
+        model.load_state_dict(candidate_state)
+        model.to(self.device)
+        score = self._evaluate(model)
+        model.load_state_dict(original)
+        model.to(self.device)
+        return score
+
     def _mixup(self, data, target):
         if self.mixup_alpha <= 0 or data.size(0) < 2:
             return data, target, target, 1.0
@@ -453,6 +587,7 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         model = self.model.to(self.device)
+        self._apply_model_regularization(model)
         self._calibrate_budget(model)
         if self.safe_epochs <= 0:
             print("  [Trainer] No safe full epoch; preserving search weights")
@@ -473,11 +608,17 @@ class Trainer:
             key: value.detach().cpu().clone()
             for key, value in model.state_dict().items()
         }
+        best_model_prototype = copy.deepcopy(model).cpu()
+        current_architecture_id = 0
+        best_architecture_id = 0
+        ema_state = self._cpu_state_dict(model)
+        checkpoint_pool = [(initial_val_acc, self._cpu_state_dict(model))]
         best_recipe = dict(self.recipe)
         attempt_best_val = initial_val_acc
         epochs_without_improvement = 0
         lr_reductions = 0
         independent_retry_count = 0
+        continuation_count = 0
         attempted_recipes = {self.recipe.get("name")}
         completed_epochs = 0
         attempt_step = 0
@@ -633,10 +774,27 @@ class Trainer:
                     key: value.detach().cpu().clone()
                     for key, value in model.state_dict().items()
                 }
+                if current_architecture_id != best_architecture_id:
+                    best_model_prototype = copy.deepcopy(model).cpu()
+                    best_architecture_id = current_architecture_id
+            self._update_ema_state(
+                ema_state,
+                model,
+                decay=min(
+                    0.999,
+                    max(0.90, 1.0 - 1.0 / (completed_epochs + 10.0)),
+                ),
+            )
+            checkpoint_pool.append((val_acc, self._cpu_state_dict(model)))
+            checkpoint_pool = sorted(
+                checkpoint_pool,
+                key=lambda item: item[0],
+                reverse=True,
+            )[:3]
 
             previous_lr = optimizer.param_groups[0]["lr"]
             if attempt_step >= self.warmup_steps:
-                plateau_scheduler.step(val_acc)
+                self._step_scheduler(plateau_scheduler, val_acc)
             current_lr = optimizer.param_groups[0]["lr"]
             if current_lr < previous_lr * 0.99:
                 lr_reductions += 1
@@ -710,16 +868,15 @@ class Trainer:
                 enough_for_retry = (
                     available >= retry_epochs * measured_epoch_time
                 )
-                max_retries = 2 if below_benchmark else 1
                 if (
-                    independent_retry_count < max_retries
-                    and self.independent_retry_state is not None
+                    self.independent_retry_state is not None
                     and alternative is not None
                     and enough_for_retry
                 ):
                     model.load_state_dict(self.independent_retry_state)
                     model.to(self.device)
                     self._apply_recipe(alternative)
+                    self._apply_model_regularization(model)
                     criterion = self._criterion()
                     optimizer, plateau_scheduler = (
                         self._make_optimizer_and_scheduler(model)
@@ -756,6 +913,7 @@ class Trainer:
                         1.0, available
                     )
                     attempt_started = time.perf_counter()
+                    ema_state = self._cpu_state_dict(model)
                     independent_retry_count += 1
                     attempted_recipes.add(
                         self.recipe.get("name")
@@ -773,19 +931,201 @@ class Trainer:
                     )
                     continue
 
-                reason = (
-                    "all safe recipe attempts are exhausted"
-                    if independent_retry_count
-                    else "no safe independent attempt remains"
-                )
-                print(
-                    "  [Trainer] Stopping exhausted attempt: {}".format(
-                        reason
+                if (
+                    self.challenger_model is not None
+                    and enough_for_retry
+                ):
+                    model = self.challenger_model.to(self.device)
+                    self.challenger_model = None
+                    self.model = model
+                    current_architecture_id = 1
+                    challenger_recipe = dict(
+                        getattr(model, "training_recipe", best_recipe)
                     )
+                    challenger_recipe["name"] = "challenger_{}".format(
+                        challenger_recipe.get("name", "stable")
+                    )
+                    self._apply_recipe(challenger_recipe)
+                    self._apply_model_regularization(model)
+                    challenger_optimizer_state = getattr(
+                        model, "search_optimizer_state", None
+                    )
+                    if hasattr(model, "search_optimizer_state"):
+                        delattr(model, "search_optimizer_state")
+                    criterion = self._criterion()
+                    optimizer, plateau_scheduler = (
+                        self._make_optimizer_and_scheduler(
+                            model, challenger_optimizer_state
+                        )
+                    )
+                    scaler = torch.cuda.amp.GradScaler(
+                        enabled=self.use_amp
+                    )
+                    challenger_seed = seed + 65_537
+                    np.random.seed(challenger_seed % (2**32 - 1))
+                    torch.manual_seed(challenger_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(challenger_seed)
+                    attempt_best_val = self._evaluate(model)
+                    if attempt_best_val > best_val_acc + 1e-6:
+                        best_val_acc = attempt_best_val
+                        best_recipe = dict(self.recipe)
+                        best_model_state = self._cpu_state_dict(model)
+                        best_model_prototype = copy.deepcopy(model).cpu()
+                        best_architecture_id = current_architecture_id
+                    epochs_without_improvement = 0
+                    lr_reductions = 0
+                    attempt_step = 0
+                    self.warmup_steps = max(
+                        1,
+                        min(
+                            32,
+                            max(1, len(self.train_dataloader)) // 4,
+                        ),
+                    )
+                    self.attempt_time_budget = max(1.0, available)
+                    attempt_started = time.perf_counter()
+                    ema_state = self._cpu_state_dict(model)
+                    checkpoint_pool = [
+                        (
+                            attempt_best_val,
+                            self._cpu_state_dict(model),
+                        )
+                    ]
+                    print(
+                        "  [Trainer] Anytime second-architecture attempt: "
+                        "{} | baseline={:.2f}%".format(
+                            self.challenger_spec,
+                            attempt_best_val * 100,
+                        )
+                    )
+                    continue
+
+                # Once all distinct recipes have been tried, keep exploiting
+                # the immutable global best with a fresh seed and a smaller
+                # learning-rate basin. This action can repeat while the clock
+                # says another full epoch is safe.
+                if (
+                    enough_for_retry
+                    and best_model_state is not None
+                ):
+                    model = copy.deepcopy(best_model_prototype)
+                    model.load_state_dict(best_model_state)
+                    model.to(self.device)
+                    self.model = model
+                    current_architecture_id = best_architecture_id
+                    continuation_count += 1
+                    continuation_recipe = dict(best_recipe)
+                    continuation_recipe["name"] = "{}_continue{}".format(
+                        best_recipe.get("name", "stable"),
+                        continuation_count,
+                    )
+                    continuation_recipe["lr_scale"] = float(
+                        best_recipe.get("lr_scale", 1.0)
+                    ) * max(
+                        0.08, 0.55 ** min(continuation_count, 5)
+                    )
+                    self._apply_recipe(continuation_recipe)
+                    self._apply_model_regularization(model)
+                    criterion = self._criterion()
+                    optimizer, plateau_scheduler = (
+                        self._make_optimizer_and_scheduler(model)
+                    )
+                    scaler = torch.cuda.amp.GradScaler(
+                        enabled=self.use_amp
+                    )
+                    continuation_seed = seed + 104729 * continuation_count
+                    np.random.seed(
+                        continuation_seed % (2**32 - 1)
+                    )
+                    torch.manual_seed(continuation_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(continuation_seed)
+                    attempt_best_val = best_val_acc
+                    epochs_without_improvement = 0
+                    lr_reductions = 0
+                    attempt_step = 0
+                    self.warmup_steps = max(
+                        1,
+                        min(
+                            16,
+                            max(1, len(self.train_dataloader)) // 8,
+                        ),
+                    )
+                    self.attempt_time_budget = max(1.0, available)
+                    attempt_started = time.perf_counter()
+                    ema_state = self._cpu_state_dict(model)
+                    checkpoint_pool = [
+                        (best_val_acc, self._cpu_state_dict(model))
+                    ]
+                    print(
+                        "  [Trainer] Anytime continuation {} from global "
+                        "best: LR {:.2e}".format(
+                            continuation_count, self.base_lr
+                        )
+                    )
+                    continue
+
+                # The guard above can be conservative for a final partial
+                # horizon. Keep the current optimizer alive; the outer clock
+                # check decides whether another epoch actually fits.
+                epochs_without_improvement = 0
+                print(
+                    "  [Trainer] No restart fits; continuing the current "
+                    "checkpoint until the prediction guard"
                 )
-                break
 
         elapsed = time.perf_counter() - training_started
+        # Evaluate rule-neutral same-architecture temporal ensembles only
+        # when a complete validation pass still fits before prediction.
+        evaluation_guard = (
+            self.prediction_reserve
+            + max(2.0, self.validation_time_estimate * 1.25)
+        )
+        if self.clock.check() > evaluation_guard:
+            ema_score = self._evaluate_state(model, ema_state)
+            if ema_score > best_val_acc + 1e-6:
+                best_val_acc = ema_score
+                best_model_state = {
+                    key: value.clone() for key, value in ema_state.items()
+                }
+                best_recipe = dict(self.recipe)
+                best_recipe["name"] = "{}_ema".format(
+                    best_recipe.get("name", "stable")
+                )
+                if current_architecture_id != best_architecture_id:
+                    best_model_prototype = copy.deepcopy(model).cpu()
+                    best_architecture_id = current_architecture_id
+                print(
+                    "  [Trainer] EMA checkpoint improved valid to {:.2f}%".format(
+                        ema_score * 100
+                    )
+                )
+        if (
+            len(checkpoint_pool) >= 2
+            and self.clock.check() > evaluation_guard
+        ):
+            averaged_state = self._average_states(
+                [state for _, state in checkpoint_pool],
+                checkpoint_pool[0][1],
+            )
+            averaged_score = self._evaluate_state(
+                model, averaged_state
+            )
+            if averaged_score > best_val_acc + 1e-6:
+                best_val_acc = averaged_score
+                best_model_state = averaged_state
+                best_recipe = dict(self.recipe)
+                best_recipe["name"] = "{}_avg".format(
+                    best_recipe.get("name", "stable")
+                )
+                if current_architecture_id != best_architecture_id:
+                    best_model_prototype = copy.deepcopy(model).cpu()
+                    best_architecture_id = current_architecture_id
+                print(
+                    "  [Trainer] Checkpoint average improved valid to "
+                    "{:.2f}%".format(averaged_score * 100)
+                )
         print(
             "  [Trainer] Training complete in {} ({} epochs). "
             "Best valid acc: {:.2f}%".format(
@@ -795,13 +1135,17 @@ class Trainer:
             )
         )
         if best_model_state is not None:
+            model = best_model_prototype.to(self.device)
             model.load_state_dict(best_model_state)
             model.to(self.device)
+            self._apply_recipe(best_recipe)
+            self._apply_model_regularization(model)
             model.training_recipe = dict(best_recipe)
             self.metadata["trainer_best_recipe"] = best_recipe.get(
                 "name", "stable"
             )
             print("  [Trainer] Restored best checkpoint")
+        self.model = model
         self.independent_retry_state = None
         return model
 
@@ -826,7 +1170,7 @@ class Trainer:
                 total += target.size(0)
         return correct / max(1, total)
 
-    def _predict_tensor(self, data):
+    def _predict_logits(self, data):
         cpu_data = data.detach().cpu()
         try:
             device_data = cpu_data.to(
@@ -835,7 +1179,7 @@ class Trainer:
             with torch.no_grad(), torch.cuda.amp.autocast(
                 enabled=self.use_amp
             ):
-                return self.model(device_data).argmax(dim=1).cpu()
+                return self.model(device_data).float().cpu()
         except RuntimeError as error:
             if not self._is_oom(error) or cpu_data.size(0) <= 1:
                 raise
@@ -846,11 +1190,18 @@ class Trainer:
             midpoint = cpu_data.size(0) // 2
             return torch.cat(
                 [
-                    self._predict_tensor(cpu_data[:midpoint]),
-                    self._predict_tensor(cpu_data[midpoint:]),
+                    self._predict_logits(cpu_data[:midpoint]),
+                    self._predict_logits(cpu_data[midpoint:]),
                 ],
                 dim=0,
             )
+
+    def _predict_tensor(self, data):
+        logits = self._predict_logits(data)
+        for dimension in self.tta_dimensions:
+            logits.add_(self._predict_logits(data.flip(dimension)))
+        logits.div_(1 + len(self.tta_dimensions))
+        return logits.argmax(dim=1)
 
     def predict(self, test_loader):
         self.model.to(self.device)

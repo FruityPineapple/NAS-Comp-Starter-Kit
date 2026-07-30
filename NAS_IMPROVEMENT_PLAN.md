@@ -1,10 +1,52 @@
 # NAS Improvement Plan
 
-**Status:** The recommended first implementation step is complete. The
-incumbent-safe staged recipe race is implemented and tested; all other
-priorities remain pending unless explicitly checked below.
+**Status:** All rule-neutral implementation work in Priorities 0-5 is now
+complete and locally tested. Two deliberately conditional experiments remain
+disabled: train-plus-validation refit pending broad historical ablation, and
+an ensemble pending explicit organizer confirmation. Historical-dataset and
+CUDA reruns also remain outstanding because those resources are not in this
+workspace.
 
 **Date:** 30 July 2026
+
+## 0. Current implementation completion record
+
+This record supersedes prospective descriptions later in the document where
+they describe the repository as it existed before implementation.
+
+- [x] Byte-bounded fingerprinting, normalization, shift/flip samples, train
+  cache, and validation cache; source dtype is preserved until per-example
+  conversion.
+- [x] Prior-preserving selection validation and disjoint confirmation
+  validation with ordinary and balanced accuracy tracked separately.
+- [x] Loss, probability margin, examples/data coverage, deterministic seeds,
+  LR, throughput, time, and CUDA peak-memory candidate measurements.
+- [x] Logical-batch gradient accumulation with reusable OOM-calibrated search
+  microbatches and progressive data cursors.
+- [x] Incumbent-safe two-stage recipe race with loss slope,
+  train-validation-gap, and confirmation acceptance.
+- [x] AdamW controls plus zero-smoothing SGD/Nesterov/cosine.
+- [x] Functional augmentation-policy comparison, byte-bounded moment shift,
+  and a cheap held-out domain-classification probe.
+- [x] Hierarchical family probes and uncertainty-aware promotion before macro
+  search.
+- [x] Categorical/dense sequence, multi-view, volumetric, coordinate,
+  spatial-axis, pre-activation grouped/wide, and dense feature-reuse anchors.
+- [x] Scalable Tier-1 search budget and a clock-driven final action queue
+  covering every recipe, a tied challenger, fresh-seed continuations, EMA,
+  checkpoint averaging, and validated-flip TTA.
+- [x] Focused memory, objective, architecture, trainer, and accelerated
+  end-to-end regression tests.
+- [ ] Run the original three and broader historical datasets with multiple
+  seeds; their arrays are not present locally.
+- [ ] Run real CUDA peak-memory/OOM validation; the local PyTorch runtime is
+  CPU-only.
+- [ ] Enable train-plus-validation refit only if leave-one-dataset-out
+  ablation shows a general benefit.
+- [ ] Enable a complementary-model ensemble only after organizer confirmation.
+
+The exact active architecture is documented in
+`submission/NAS_ARCHITECTURE.md`.
 
 **Primary evidence:** The current repository, the competition evaluator, and
 the latest three-dataset run log at:
@@ -111,12 +153,14 @@ Ensembling should therefore remain optional and should be confirmed with the
 organizers before being enabled. None of the core recommendations below
 requires an ensemble.
 
-## 3. Concise description of the current NAS architecture
+## 3. Concise description of the pre-improvement baseline
 
-The active implementation is documented in
-[`submission/NAS_ARCHITECTURE.md`](submission/NAS_ARCHITECTURE.md). Its first
-section explicitly overrides contradictory historical descriptions later in
-that file. The code remains the final authority.
+This section intentionally records the architecture that produced the latest
+three-dataset evidence. It is retained so the rationale is reproducible; it is
+not the active post-implementation architecture. The active implementation is
+summarized in Section 0 and documented in
+[`submission/NAS_ARCHITECTURE.md`](submission/NAS_ARCHITECTURE.md). The code
+remains the final authority.
 
 ### 3.1 Data processing
 
@@ -589,18 +633,19 @@ introduce avoidable `-10` failures.
 
 Changes:
 
-1. Preserve class priors in the main search-validation sample.
-2. Track a separate balanced metric instead of balancing the sample itself.
-3. Split validation deterministically into selection and confirmation subsets.
-4. Log validation loss, accuracy, balanced accuracy, margin, examples seen,
+1. [x] Preserve class priors in the main search-validation sample.
+2. [x] Track a separate balanced metric instead of balancing the sample itself.
+3. [x] Split validation deterministically into selection and confirmation subsets.
+4. [x] Log validation loss, accuracy, balanced accuracy, margin, examples seen,
    data coverage, seed, LR, time, and peak memory for every candidate.
-5. Use the same stochastic seed schedule and data order for paired candidate
+5. [x] Use the same stochastic seed schedule and data order for paired candidate
    comparisons.
-6. Evaluate two seeds only for final tied candidates.
-7. Convert normalization statistics to a byte-bounded streaming calculation.
-8. Add byte caps to both train and validation caches.
-9. Avoid whole-dataset dtype conversion.
-10. Calibrate microbatch size before architecture racing and use gradient
+6. [x] Evaluate a fresh seed/continuation only for a statistically tied second
+   architecture.
+7. [x] Convert normalization statistics to a byte-bounded streaming calculation.
+8. [x] Add byte caps to both train and validation caches.
+9. [x] Avoid whole-dataset dtype conversion.
+10. [x] Calibrate microbatch size before architecture racing and use gradient
     accumulation where necessary.
 
 Expected benefit:
@@ -626,10 +671,10 @@ Changes:
    source used for recipe trials.
 2. [x] Include the unchanged common checkpoint as the incumbent.
 3. [x] Give each recipe a short first stage.
-4. [ ] Complete the full planned promotion-signal bundle.
+4. [x] Complete the full planned promotion-signal bundle.
    - [x] Promote two recipes using best validation accuracy and bounded
      validation-loss slope.
-   - [ ] Add an explicit train-validation-gap term after it can be measured
+   - [x] Add an explicit train-validation-gap term after it can be measured
      fairly without increasing tournament data passes.
 5. [x] Preserve the best evaluated stage state within each recipe trial, not
    only its last state.
@@ -637,9 +682,9 @@ Changes:
    configurable noise margin.
 7. [x] Pass the winning optimizer state into Trainer only when it belongs to the
    returned winning checkpoint.
-8. [ ] Add SGD with Nesterov and cosine decay as a genuinely different optimizer
+8. [x] Add SGD with Nesterov and cosine decay as a genuinely different optimizer
    path; retain AdamW recipes.
-9. [ ] Add a zero-smoothing or very-low-smoothing recipe.
+9. [x] Add a zero-smoothing or very-low-smoothing recipe.
 
 Completed implementation scope:
 
@@ -676,19 +721,19 @@ informative learning curve.
 
 Changes:
 
-1. Create one compact, calibrated probe model for each plausible
+1. [x] Create one compact, calibrated probe model for each plausible
    representation family.
-2. Train probes on the same distinct data coverage for approximately one
+2. [x] Train probes on the same distinct data coverage for approximately one
    epoch, or until loss slope is measurable.
-3. Promote the best two families with uncertainty-aware ties.
-4. Search macro dimensions only inside the promoted families.
-5. Use progressive data coverage rather than repeatedly replaying the
+3. [x] Promote the best two families with uncertainty-aware ties.
+4. [x] Search macro dimensions only inside the promoted families.
+5. [x] Use progressive data coverage rather than repeatedly replaying the
    beginning of a fixed cache.
-6. Treat zero-cost proxies as ordering or duplicate-reduction tools only.
-7. Promote using loss, accuracy, slope, and an optimistic confidence bound.
-8. Continue tied full-validation finalists rather than blending an arbitrary
+6. [x] Treat zero-cost proxies as ordering or duplicate-reduction tools only.
+7. [x] Promote using loss, accuracy, slope, and an optimistic confidence bound.
+8. [x] Continue tied full-validation finalists rather than blending an arbitrary
    0.03-point difference with old ranks.
-9. Retain the second finalist's specification and optional checkpoint for an
+9. [x] Retain the second finalist's specification and optional checkpoint for an
    anytime fallback.
 
 Expected benefit:
@@ -709,22 +754,22 @@ Primary risk:
 
 Changes:
 
-1. Replace the fixed six-minute Tier 1 search cap with a budget curve based on:
+1. [x] Replace the fixed six-minute Tier 1 search cap with a budget curve based on:
    - total remaining time;
    - measured epoch time;
    - number of plausible families;
    - whether architecture ranking has stabilized.
-2. Remove `max_epochs = 400` as a hard multi-hour ceiling; retain only a very
+2. [x] Remove `max_epochs = 400` as a hard multi-hour ceiling; retain only a very
    high safety ceiling plus the clock.
-3. Replace retry-count termination with an ordered anytime action queue:
-   - continue the best checkpoint with EMA;
-   - run an untried optimizer/recipe;
-   - run a new seed from the best common checkpoint;
-   - continue the second architecture finalist;
-   - try SWA or same-architecture checkpoint averaging;
-   - optionally refit after locking the policy.
-4. Keep the global best validation checkpoint immutable.
-5. Estimate prediction reserve from measured batches with a conservative upper
+3. [x] Replace retry-count termination with an ordered anytime action queue:
+   - [x] continue the best checkpoint with EMA;
+   - [x] run every untried optimizer/recipe;
+   - [x] run a new seed from the best checkpoint;
+   - [x] continue the second architecture finalist when statistically tied;
+   - [x] try same-architecture checkpoint averaging;
+   - [ ] optionally refit after locking the policy, pending broad ablation.
+4. [x] Keep the global best validation checkpoint immutable.
+5. [x] Estimate prediction reserve from measured batches with a conservative upper
    bound rather than an unconditional 180-second maximum.
 
 A reasonable initial 30-minute split to test is:
@@ -756,7 +801,7 @@ Primary risk:
 
 Add families in this order so each addition can be ablated.
 
-#### 4.1 Categorical sequence family
+#### [x] 4.1 Categorical sequence family
 
 For an approximately one-hot axis:
 
@@ -772,7 +817,7 @@ Likely coverage:
 - Language-like and Gutenberg-like data;
 - other symbolic sequences encoded as grids.
 
-#### 4.2 Dense embedding sequence family
+#### [x] 4.2 Dense embedding sequence family
 
 For one short axis and one large continuous feature axis:
 
@@ -786,7 +831,7 @@ Likely coverage:
 - Cryptic-like pretrained embeddings;
 - spectrogram or feature-vector sequences when detected by probes.
 
-#### 4.3 Channel-independent and multi-view family
+#### [x] 4.3 Channel-independent and multi-view family
 
 - shared or separate 2D stems per channel or channel group;
 - late feature fusion;
@@ -799,7 +844,7 @@ Likely coverage:
 - AddNIST/MultNIST-like independent channel images;
 - multi-sensor inputs.
 
-#### 4.4 Volumetric and temporal-spatial family
+#### [x] 4.4 Volumetric and temporal-spatial family
 
 - small Conv3D or axial 3D convolutions when channel and spatial dimensions
   appear exchangeable;
@@ -812,7 +857,7 @@ Likely coverage:
 - Voxel-like data;
 - Windspeed-like temporal scientific grids.
 
-#### 4.5 Position-sensitive board and hybrid families
+#### [x] 4.5 Position-sensitive board and hybrid families
 
 - CoordConv or explicit normalized coordinates;
 - 4x4 or adaptive multi-level spatial-pyramid pooling;
@@ -824,7 +869,7 @@ Likely coverage:
 - Sudoku and Chesseract-like boards;
 - ambiguous data where both local 2D structure and absolute position matter.
 
-#### 4.6 Stronger generic image anchors
+#### [x] 4.6 Stronger generic image anchors
 
 Add a small number of structurally different, well-tested anchors:
 
@@ -854,22 +899,22 @@ Primary risks:
 
 Changes:
 
-1. Keep an identity/evaluation transform available to every task.
-2. Compare a very small augmentation portfolio with a compact anchor:
+1. [x] Keep an identity/evaluation transform available to every task.
+2. [x] Compare a very small augmentation portfolio with a compact anchor:
    - identity;
    - translation/crop;
    - verified horizontal/vertical flips;
    - light erasing or CutMix for natural-image-like data.
-3. Do not infer flip safety solely from grayscale/color.
-4. Detect train-validation distribution shift through simple per-axis moments
+3. [x] Do not infer flip safety solely from grayscale/color.
+4. [x] Detect train-validation distribution shift through simple per-axis moments
    and a cheap domain-classification probe.
-5. Add EMA during every final attempt.
-6. Test SWA or same-architecture checkpoint averaging when time remains.
-7. Search dropout/stochastic-depth strength with the recipe.
-8. After architecture, optimizer, and epoch policy are locked, test a
+5. [x] Add EMA during every final attempt.
+6. [x] Test same-architecture checkpoint averaging when time remains.
+7. [x] Search dropout strength with the recipe.
+8. [ ] After architecture, optimizer, and epoch policy are locked, test a
    train-plus-validation refit as a separate ablation. It must not use test
    labels or select on test predictions.
-9. Consider test-time augmentation only for transformations already validated
+9. [x] Use test-time augmentation only for transformations already validated
    as label-preserving.
 
 Expected benefit:
@@ -887,6 +932,8 @@ Primary risks:
 
 ### Priority 6: Optional complementary-model ensemble
 
+**Status: [ ] deliberately disabled pending organizer confirmation.**
+
 Only after organizer confirmation:
 
 - retain two finalists only when their validation accuracies are tied and their
@@ -900,11 +947,9 @@ averaging.
 
 ## 7. Exact files and components that would need to change
 
-First-step status: `submission/nas.py` and
-`test_controller_refinements.py` have been modified, and
-`submission/NAS_ARCHITECTURE.md`, `submission/README.md`, and this plan have
-been updated accordingly. The remaining files in this table are still
-prospective.
+Implementation status: all rule-neutral responsibilities below are active.
+`submission/ensemble.py` remains inactive, and train-plus-validation refit
+remains an empirical follow-up rather than enabled competition behavior.
 
 | File | Components | Planned responsibility |
 |---|---|---|
@@ -921,8 +966,10 @@ prospective.
 | `test_architecture_fixes.py` | search-space tests | New family activation, shapes, parameter counts, forward compatibility |
 | `test_data_processor.py` | data-processing tests | No full dtype copy, streaming stats, byte caps, augmentation policy behavior |
 | `test_full_pipeline.py` | end-to-end synthetic tiers | Full prediction count, short-budget fallbacks, no idle/crash behavior |
-| New `test_memory_safety.py` | proposed | Large synthetic shapes/dtypes, cache-byte ceilings, OOM fallback |
-| New `test_search_objective.py` | proposed | Prior-preserving validation, confidence ties, loss/slope promotion |
+| `test_memory_safety.py` | implemented | Large synthetic shapes/dtypes, cache-byte ceilings, logical microbatches |
+| `test_search_objective.py` | implemented | Prior-preserving validation, confirmation, confidence, loss/gap promotion |
+| `test_trainer_anytime.py` | implemented | SGD/cosine, TTA, dormant challenger, clock-driven training |
+| `test_accelerated_pipeline.py` | implemented | Fast Tier-1 processing/search/training/prediction integration |
 
 Files that must **not** be modified for a submission:
 

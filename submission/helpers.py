@@ -293,12 +293,18 @@ def inspect_data_properties(train_x):
             else 0.0
         )
     )
+    is_categorical_grid = (
+        channels == 1
+        and max(sequence_width_confidence, sequence_height_confidence) >= 0.70
+    )
     natural_image_confidence = float(
         (
             0.85
             if channels == 3
-            and not is_standardized
             and not is_categorical_grid
+            and min(height, width) >= 16
+            and rounded_unique > 64
+            and normalized_spatial_variance >= 0.50
             else (
                 0.35
                 if channels in (1, 3)
@@ -314,10 +320,6 @@ def inspect_data_properties(train_x):
             board_confidence,
             0.55 if is_standardized and channels > 1 else 0.0,
         )
-    )
-    is_categorical_grid = (
-        channels == 1
-        and max(sequence_width_confidence, sequence_height_confidence) >= 0.70
     )
     representation_hypotheses = {
         # Spatial structure is never ruled out from a fingerprint alone.

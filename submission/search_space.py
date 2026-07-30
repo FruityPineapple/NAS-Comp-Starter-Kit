@@ -432,8 +432,369 @@ class DualAxisNetwork(nn.Module):
         return self.head(features)
 
 
+class TokenSequenceNetwork(nn.Module):
+    """Soft token projection with local TCN and global attention views."""
+
+    def __init__(
+        self,
+        input_features,
+        sequence_direction,
+        hidden,
+        kernel_size,
+        num_classes,
+        dropout,
+    ):
+        super().__init__()
+        self.sequence_direction = sequence_direction
+        self.input_norm = nn.LayerNorm(input_features)
+        self.projection = nn.Linear(input_features, hidden)
+        kernels = tuple(dict.fromkeys((1, 3, int(kernel_size))))
+        self.local = nn.ModuleList(
+            [
+                nn.Conv1d(
+                    hidden,
+                    hidden,
+                    kernel,
+                    padding=kernel // 2,
+                    groups=1,
+                    bias=False,
+                )
+                for kernel in kernels
+            ]
+        )
+        heads = 4 if hidden % 4 == 0 else 1
+        self.attention = nn.MultiheadAttention(
+            hidden,
+            heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(3 * hidden)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(3 * hidden, num_classes),
+        )
+
+    @staticmethod
+    def _position_encoding(tokens):
+        _, length, hidden = tokens.shape
+        if length <= 1:
+            return tokens
+        position = torch.arange(
+            length, device=tokens.device, dtype=torch.float32
+        ).unsqueeze(1)
+        frequency = torch.exp(
+            torch.arange(
+                0, hidden, 2, device=tokens.device, dtype=torch.float32
+            )
+            * (-math.log(10_000.0) / max(1, hidden))
+        )
+        encoding = torch.zeros(
+            1, length, hidden, device=tokens.device, dtype=torch.float32
+        )
+        encoding[0, :, 0::2] = torch.sin(position * frequency)
+        if hidden > 1:
+            encoding[0, :, 1::2] = torch.cos(
+                position * frequency[: encoding[:, :, 1::2].shape[-1]]
+            )
+        return tokens + encoding.to(dtype=tokens.dtype)
+
+    def forward(self, x):
+        batch, channels, height, width = x.shape
+        if self.sequence_direction == "width":
+            tokens = x.reshape(batch, channels * height, width).transpose(1, 2)
+        else:
+            tokens = x.permute(0, 1, 3, 2).reshape(
+                batch, channels * width, height
+            ).transpose(1, 2)
+        tokens = self._position_encoding(
+            torch.relu(self.projection(self.input_norm(tokens)))
+        )
+        local = torch.stack(
+            [
+                torch.relu(layer(tokens.transpose(1, 2))).transpose(1, 2)
+                for layer in self.local
+            ],
+            dim=0,
+        ).mean(dim=0)
+        attended, _ = self.attention(
+            tokens, tokens, tokens, need_weights=False
+        )
+        features = torch.cat(
+            [
+                local.mean(dim=1),
+                local.amax(dim=1),
+                attended.mean(dim=1),
+            ],
+            dim=1,
+        )
+        return self.classifier(self.output_norm(features))
+
+
+class MultiViewNetwork(nn.Module):
+    """Encode channels independently with shared weights, then fuse late."""
+
+    def __init__(self, hidden, num_classes, dropout):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, padding=1, bias=False),
+            _group_norm(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, stride=2, padding=1, bias=False),
+            _group_norm(hidden),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+        self.ordered_fusion = nn.Conv1d(
+            hidden, hidden, 3, padding=1, bias=False
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(4 * hidden),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden, num_classes),
+        )
+
+    def forward(self, x):
+        batch, channels, height, width = x.shape
+        views = self.encoder(x.reshape(batch * channels, 1, height, width))
+        views = views.reshape(batch, channels, -1)
+        mean = views.mean(dim=1)
+        maximum = views.amax(dim=1)
+        deviation = views.std(dim=1, unbiased=False)
+        ordered = torch.relu(
+            self.ordered_fusion(views.transpose(1, 2))
+        ).mean(dim=2)
+        return self.head(torch.cat([mean, maximum, deviation, ordered], dim=1))
+
+
+class VolumetricNetwork(nn.Module):
+    """Small Conv3D anchor for depth/temporal stacks stored as channels."""
+
+    def __init__(self, hidden, num_classes, dropout):
+        super().__init__()
+        hidden = max(8, min(32, int(hidden)))
+        self.features = nn.Sequential(
+            nn.Conv3d(1, hidden, 3, padding=1, bias=False),
+            nn.GroupNorm(min(8, hidden), hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                hidden,
+                2 * hidden,
+                3,
+                stride=(1, 2, 2),
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(min(8, 2 * hidden), 2 * hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(
+                2 * hidden,
+                2 * hidden,
+                3,
+                stride=(2, 1, 1),
+                padding=1,
+                groups=2 * hidden,
+                bias=False,
+            ),
+            nn.GroupNorm(min(8, 2 * hidden), 2 * hidden),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+        )
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(2 * hidden, num_classes),
+        )
+
+    def forward(self, x):
+        return self.head(self.features(x.unsqueeze(1)))
+
+
+class CoordinateSpatialNetwork(nn.Module):
+    """Append normalized coordinates before a multi-level spatial backbone."""
+
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, x):
+        batch, _, height, width = x.shape
+        y = torch.linspace(
+            -1.0, 1.0, height, device=x.device, dtype=x.dtype
+        ).view(1, 1, height, 1)
+        x_coordinate = torch.linspace(
+            -1.0, 1.0, width, device=x.device, dtype=x.dtype
+        ).view(1, 1, 1, width)
+        coordinates = torch.cat(
+            [
+                y.expand(batch, 1, height, width),
+                x_coordinate.expand(batch, 1, height, width),
+            ],
+            dim=1,
+        )
+        return self.backbone(torch.cat([x, coordinates], dim=1))
+
+
+class MultiLevelPyramidHead(nn.Module):
+    def __init__(self, channels, num_classes, dropout):
+        super().__init__()
+        features = 21 * channels
+        self.norm = nn.LayerNorm(features)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(features, num_classes)
+
+    def forward(self, x):
+        pooled = [
+            nn.functional.adaptive_avg_pool2d(x, bins).flatten(1)
+            for bins in (1, 2, 4)
+        ]
+        return self.classifier(
+            self.dropout(self.norm(torch.cat(pooled, dim=1)))
+        )
+
+
+class SpatialAxisHybridNetwork(nn.Module):
+    """Fuse learned local spatial features with raw row/column summaries."""
+
+    def __init__(
+        self,
+        spatial_encoder,
+        in_channels,
+        input_height,
+        input_width,
+        spatial_features,
+        hidden,
+        num_classes,
+        dropout,
+    ):
+        super().__init__()
+        self.spatial_encoder = spatial_encoder
+        self.row_projection = nn.Linear(in_channels * input_height, hidden)
+        self.column_projection = nn.Linear(in_channels * input_width, hidden)
+        features = spatial_features + 2 * hidden
+        self.head = nn.Sequential(
+            nn.LayerNorm(features),
+            nn.Dropout(dropout),
+            nn.Linear(features, num_classes),
+        )
+
+    def forward(self, x):
+        spatial = self.spatial_encoder(x)
+        rows = torch.relu(self.row_projection(x.mean(dim=3).flatten(1)))
+        columns = torch.relu(
+            self.column_projection(x.mean(dim=2).flatten(1))
+        )
+        return self.head(torch.cat([spatial, rows, columns], dim=1))
+
+
+class PreActivationBlock(nn.Module):
+    """GroupNorm pre-activation block used by the wide image anchor."""
+
+    def __init__(self, in_channels, out_channels, stride=1, groups=1):
+        super().__init__()
+        groups = max(1, min(int(groups), out_channels))
+        while out_channels % groups:
+            groups -= 1
+        self.norm1 = _group_norm(in_channels)
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            3,
+            stride=stride,
+            padding=1,
+            groups=groups if in_channels % groups == 0 else 1,
+            bias=False,
+        )
+        self.norm2 = _group_norm(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, 3, padding=1, bias=False
+        )
+        self.shortcut = (
+            nn.Conv2d(
+                in_channels, out_channels, 1, stride=stride, bias=False
+            )
+            if stride != 1 or in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        activated = torch.relu(self.norm1(x))
+        shortcut = self.shortcut(activated)
+        out = self.conv1(activated)
+        out = self.conv2(torch.relu(self.norm2(out)))
+        return out + shortcut
+
+
+class DenseReuseLayer(nn.Module):
+    """Compact DenseNet-style layer with explicit feature reuse."""
+
+    def __init__(self, in_channels, growth):
+        super().__init__()
+        hidden = 2 * growth
+        self.norm1 = _group_norm(in_channels)
+        self.conv1 = nn.Conv2d(
+            in_channels, hidden, 1, bias=False
+        )
+        self.norm2 = _group_norm(hidden)
+        self.conv2 = nn.Conv2d(
+            hidden, growth, 3, padding=1, bias=False
+        )
+
+    def forward(self, x):
+        features = self.conv1(torch.relu(self.norm1(x)))
+        features = self.conv2(torch.relu(self.norm2(features)))
+        return torch.cat([x, features], dim=1)
+
+
+class DenseReuseNetwork(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        initial_channels,
+        stages,
+        layers_per_stage,
+        num_classes,
+        dropout,
+    ):
+        super().__init__()
+        growth = max(8, initial_channels // 2)
+        self.stem = nn.Conv2d(
+            in_channels, initial_channels, 3, padding=1, bias=False
+        )
+        blocks = []
+        channels = initial_channels
+        for stage in range(stages):
+            for _ in range(layers_per_stage):
+                blocks.append(DenseReuseLayer(channels, growth))
+                channels += growth
+            if stage + 1 < stages:
+                output = max(initial_channels, channels // 2)
+                blocks.extend(
+                    [
+                        _group_norm(channels),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(channels, output, 1, bias=False),
+                        nn.AvgPool2d(2),
+                    ]
+                )
+                channels = output
+        self.features = nn.Sequential(*blocks)
+        self.head = nn.Sequential(
+            _group_norm(channels),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(channels, num_classes),
+        )
+
+    def forward(self, x):
+        return self.head(self.features(self.stem(x)))
+
+
 def _init_weights(module):
-    if isinstance(module, (nn.Conv1d, nn.Conv2d)):
+    if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
         nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
     elif isinstance(module, nn.modules.batchnorm._BatchNorm):
         nn.init.constant_(module.weight, 1)
@@ -500,6 +861,64 @@ class SearchSpace:
             or position_confidence >= 0.35
         ):
             self.model_families.append("dual_axis")
+        categorical_confidence = max(
+            width_confidence, height_confidence
+        )
+        dense_confidence = float(
+            hypotheses.get(
+                "dense_sequence",
+                self.data_props.get("dense_sequence_confidence", 0.0),
+            )
+        )
+        channel_independence = float(
+            hypotheses.get(
+                "channel_independent",
+                self.data_props.get(
+                    "channel_independence_confidence", 0.0
+                ),
+            )
+        )
+        volumetric = float(
+            hypotheses.get(
+                "volumetric",
+                self.data_props.get("volumetric_confidence", 0.0),
+            )
+        )
+        board = float(
+            hypotheses.get(
+                "board", self.data_props.get("board_confidence", 0.0)
+            )
+        )
+        fixed_coordinate = float(
+            hypotheses.get(
+                "fixed_coordinate",
+                self.data_props.get("fixed_coordinate_confidence", 0.0),
+            )
+        )
+        natural_image = float(
+            hypotheses.get(
+                "natural_image",
+                self.data_props.get("natural_image_confidence", 0.0),
+            )
+        )
+        if categorical_confidence >= 0.55:
+            self.model_families.append("categorical_sequence")
+        if dense_confidence >= 0.35:
+            self.model_families.append("dense_sequence")
+        if self.in_channels >= 2 and channel_independence >= 0.35:
+            self.model_families.append("multiview")
+        if self.in_channels >= 4 and volumetric >= 0.40:
+            self.model_families.append("volumetric")
+        if board >= 0.35 or fixed_coordinate >= 0.65:
+            self.model_families.append("coord_spatial")
+        if (
+            max(width_confidence, height_confidence) >= 0.25
+            or fixed_coordinate >= 0.65
+        ):
+            self.model_families.append("spatial_axis")
+        if natural_image >= 0.65:
+            self.model_families.append("wide_residual")
+            self.model_families.append("dense_reuse")
 
         min_dim = min(self.input_height, self.input_width)
         if min_dim <= 1:
@@ -526,7 +945,20 @@ class SearchSpace:
             for stages in self.NUM_STAGES
             if stages <= self.max_safe_stages
         ] or [1]
-        return [
+        base_families = [
+            family
+            for family in self.model_families
+            if family
+            in {
+                "spatial",
+                "spatial_pyramid",
+                "factorized",
+                "axis_width",
+                "axis_height",
+                "dual_axis",
+            }
+        ]
+        specs = [
             ArchSpec(*values)
             for values in itertools.product(
                 safe_stages,
@@ -536,9 +968,27 @@ class SearchSpace:
                 self.KERNEL_SIZES,
                 self.USE_SE,
                 self.STEM_KERNELS,
-                self.model_families,
+                base_families,
             )
         ]
+        # Semantic families are deliberately represented by only a few
+        # structurally meaningful anchors. Replicating the full residual grid
+        # would dilute their label-training fidelity without adding diversity.
+        specialized = [
+            family
+            for family in self.model_families
+            if family not in base_families
+        ]
+        anchor_values = (
+            (min(2, self.max_safe_stages), 16, 1, "basic", 3, False, 3),
+            (min(3, self.max_safe_stages), 32, 2, "basic", 3, False, 3),
+            (min(3, self.max_safe_stages), 32, 2, "bottleneck", 5, True, 5),
+        )
+        for family in specialized:
+            specs.extend(
+                ArchSpec(*values, family) for values in anchor_values
+            )
+        return list(dict.fromkeys(specs))
 
     def sample(self, n=1, rng=None):
         rng = rng or random
@@ -683,6 +1133,119 @@ class SearchSpace:
         )
         return DualAxisNetwork(width_encoder, height_encoder, head)
 
+    def _sequence_direction(self, family):
+        if family == "dense_sequence":
+            return str(
+                self.data_props.get("dense_sequence_direction", "width")
+            )
+        width = float(
+            self.data_props.get("sequence_width_confidence", 0.0)
+        )
+        height = float(
+            self.data_props.get("sequence_height_confidence", 0.0)
+        )
+        return "width" if width >= height else "height"
+
+    def _build_token_sequence_model(self, spec):
+        direction = self._sequence_direction(spec.model_family)
+        input_features = self.in_channels * (
+            self.input_height
+            if direction == "width"
+            else self.input_width
+        )
+        return TokenSequenceNetwork(
+            input_features,
+            direction,
+            spec.init_channels,
+            spec.kernel_size,
+            self.num_classes,
+            self._dropout(spec),
+        )
+
+    def _build_coordinate_model(self, spec):
+        stem = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels + 2,
+                spec.init_channels,
+                spec.stem_kernel,
+                padding=spec.stem_kernel // 2,
+                bias=False,
+            ),
+            _group_norm(spec.init_channels),
+            nn.ReLU(inplace=True),
+        )
+        stages, channels = self._build_stages_2d(spec)
+        backbone = FlexibleNetwork(
+            stem,
+            stages,
+            MultiLevelPyramidHead(
+                channels, self.num_classes, self._dropout(spec)
+            ),
+        )
+        return CoordinateSpatialNetwork(backbone)
+
+    def _build_spatial_axis_model(self, spec):
+        stem = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels,
+                spec.init_channels,
+                spec.stem_kernel,
+                padding=spec.stem_kernel // 2,
+                bias=False,
+            ),
+            _group_norm(spec.init_channels),
+            nn.ReLU(inplace=True),
+        )
+        stages, channels = self._build_stages_2d(spec)
+        encoder = nn.Sequential(
+            stem,
+            *stages,
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+        return SpatialAxisHybridNetwork(
+            encoder,
+            self.in_channels,
+            self.input_height,
+            self.input_width,
+            channels,
+            spec.init_channels,
+            self.num_classes,
+            self._dropout(spec),
+        )
+
+    def _build_wide_residual_model(self, spec):
+        stem = nn.Conv2d(
+            self.in_channels,
+            spec.init_channels,
+            3,
+            padding=1,
+            bias=False,
+        )
+        layers = []
+        current = spec.init_channels
+        groups = 4 if spec.block_type == "bottleneck" else 1
+        for stage in range(spec.num_stages):
+            output = spec.init_channels * (2**stage)
+            for block in range(spec.blocks_per_stage):
+                stride = 2 if stage > 0 and block == 0 else 1
+                layers.append(
+                    PreActivationBlock(current, output, stride, groups)
+                )
+                current = output
+        return FlexibleNetwork(
+            stem,
+            layers,
+            nn.Sequential(
+                _group_norm(current),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Dropout(self._dropout(spec)),
+                nn.Linear(current, self.num_classes),
+            ),
+        )
+
     def build_model(self, spec):
         if spec.model_family in ("spatial", "spatial_pyramid", "factorized"):
             model = self._build_spatial_model(spec)
@@ -692,6 +1255,38 @@ class SearchSpace:
             model = self._build_axis_model(spec, "height")
         elif spec.model_family == "dual_axis":
             model = self._build_dual_axis_model(spec)
+        elif spec.model_family in (
+            "categorical_sequence",
+            "dense_sequence",
+        ):
+            model = self._build_token_sequence_model(spec)
+        elif spec.model_family == "multiview":
+            model = MultiViewNetwork(
+                spec.init_channels,
+                self.num_classes,
+                self._dropout(spec),
+            )
+        elif spec.model_family == "volumetric":
+            model = VolumetricNetwork(
+                spec.init_channels,
+                self.num_classes,
+                self._dropout(spec),
+            )
+        elif spec.model_family == "coord_spatial":
+            model = self._build_coordinate_model(spec)
+        elif spec.model_family == "spatial_axis":
+            model = self._build_spatial_axis_model(spec)
+        elif spec.model_family == "wide_residual":
+            model = self._build_wide_residual_model(spec)
+        elif spec.model_family == "dense_reuse":
+            model = DenseReuseNetwork(
+                self.in_channels,
+                spec.init_channels,
+                spec.num_stages,
+                spec.blocks_per_stage,
+                self.num_classes,
+                self._dropout(spec),
+            )
         else:
             raise ValueError("Unknown model family: {}".format(spec.model_family))
         model.apply(_init_weights)
@@ -787,6 +1382,24 @@ class SearchSpace:
         return total, current_channels * position_bins + input_features
 
     def parameter_count(self, spec):
+        if spec.model_family in {
+            "categorical_sequence",
+            "dense_sequence",
+            "multiview",
+            "volumetric",
+            "coord_spatial",
+            "spatial_axis",
+            "wide_residual",
+            "dense_reuse",
+        }:
+            # Only three anchors exist per semantic family, so exact module
+            # counting is cheap and safer than duplicating seven formulas.
+            return int(
+                sum(
+                    parameter.numel()
+                    for parameter in self.build_model(spec).parameters()
+                )
+            )
         if spec.model_family in ("spatial", "spatial_pyramid", "factorized"):
             total, features = self._backbone_2d_parameter_count(spec)
             if spec.model_family == "spatial_pyramid":
@@ -822,23 +1435,4 @@ class SearchSpace:
 
     @property
     def size(self):
-        safe_stages = max(
-            1,
-            len(
-                [
-                    stages
-                    for stages in self.NUM_STAGES
-                    if stages <= self.max_safe_stages
-                ]
-            ),
-        )
-        return (
-            safe_stages
-            * len(self.INIT_CHANNELS)
-            * len(self.BLOCKS_PER_STAGE)
-            * len(self.BLOCK_TYPES)
-            * len(self.KERNEL_SIZES)
-            * len(self.USE_SE)
-            * len(self.STEM_KERNELS)
-            * len(self.model_families)
-        )
+        return len(self.all_specs())

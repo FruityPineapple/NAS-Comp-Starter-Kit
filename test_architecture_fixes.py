@@ -58,6 +58,9 @@ def test_portfolio_families_are_available_and_counted_exactly():
         "axis_width",
         "axis_height",
         "dual_axis",
+        "categorical_sequence",
+        "coord_spatial",
+        "spatial_axis",
     }
     assert {spec.model_family for spec in space.all_specs()} == expected
 
@@ -97,18 +100,59 @@ def test_axis_encoder_retains_coarse_position():
     assert not torch.allclose(first_features, reversed_features)
 
 
-def test_natural_image_space_uses_safe_spatial_portfolio():
+def test_standardized_rgb_keeps_generic_image_anchors_available():
     values = np.random.RandomState(7).randn(64, 3, 28, 28).astype(np.float32)
     props = inspect_data_properties(values)
     assert not props["is_categorical_grid"]
 
     space = SearchSpace(3, 20, 28, 28, data_props=props)
-    assert space.size == 1944
+    assert space.size == 1953
     assert {spec.model_family for spec in space.all_specs()} == {
         "spatial",
         "spatial_pyramid",
         "factorized",
+        "multiview",
+        "wide_residual",
+        "dense_reuse",
     }
+
+
+def _assert_family_forward(values, classes, family):
+    props = inspect_data_properties(values)
+    space = SearchSpace(
+        values.shape[1],
+        classes,
+        values.shape[2],
+        values.shape[3],
+        data_props=props,
+    )
+    assert family in space.model_families
+    spec = next(
+        spec for spec in space.all_specs() if spec.model_family == family
+    )
+    model = space.build_model(spec).eval()
+    exact = sum(parameter.numel() for parameter in model.parameters())
+    assert space.parameter_count(spec) == exact
+    with torch.no_grad():
+        output = model(torch.from_numpy(values[:2]).float())
+    assert output.shape == (2, classes)
+
+
+def test_semantic_family_activation_and_forward_paths():
+    rng = np.random.RandomState(13)
+    dense = rng.rand(32, 1, 8, 128).astype(np.float32)
+    _assert_family_forward(dense, 4, "dense_sequence")
+
+    multiview = rng.rand(32, 3, 32, 32).astype(np.float32)
+    _assert_family_forward(multiview, 5, "multiview")
+    _assert_family_forward(multiview, 5, "wide_residual")
+    _assert_family_forward(multiview, 5, "dense_reuse")
+
+    volume = rng.rand(32, 8, 16, 16).astype(np.float32)
+    _assert_family_forward(volume, 3, "volumetric")
+
+    board = rng.randint(0, 9, size=(32, 1, 9, 9)).astype(np.float32)
+    _assert_family_forward(board, 6, "coord_spatial")
 
 
 if __name__ == "__main__":
@@ -116,5 +160,6 @@ if __name__ == "__main__":
     test_portfolio_families_are_available_and_counted_exactly()
     test_row_encoded_grid_activates_height_axis()
     test_axis_encoder_retains_coarse_position()
-    test_natural_image_space_uses_safe_spatial_portfolio()
+    test_standardized_rgb_keeps_generic_image_anchors_available()
+    test_semantic_family_activation_and_forward_paths()
     print("Portfolio and structured-grid regression tests passed")

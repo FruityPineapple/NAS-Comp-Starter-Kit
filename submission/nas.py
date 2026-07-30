@@ -93,11 +93,18 @@ class NAS:
                 max_search_seconds=120,
                 round_plan=((0.35, 3), (0.85, 2)),
             )
+        # Scale the architecture/recipe investigation on long final-phase
+        # budgets instead of stopping after six minutes regardless of the
+        # supplied clock. Warm-started search updates are retained.
+        scalable_search_cap = min(
+            30 * 60.0,
+            max(360.0, 0.24 * remaining),
+        )
         return self._search_pipeline(
             n_candidates=54,
             n_top=12,
-            search_fraction=0.18,
-            max_search_seconds=360,
+            search_fraction=0.22,
+            max_search_seconds=scalable_search_cap,
             round_plan=((0.35, 7), (0.70, 4), (1.00, 2)),
         )
 
@@ -124,18 +131,27 @@ class NAS:
         recipes = [
             {
                 "name": "stable",
+                "optimizer": "adamw",
+                "scheduler": "plateau",
                 "lr_scale": 1.0,
                 "weight_decay": 1e-2,
-                "label_smoothing": 0.05,
+                # The unregularized control is important on symbolic and
+                # already-noisy tasks where smoothing can suppress the best
+                # attainable confidence.
+                "label_smoothing": 0.0,
                 "mixup_alpha": 0.0,
+                "dropout_scale": 0.75,
                 "use_class_weights": False,
             },
             {
                 "name": "regularized",
+                "optimizer": "adamw",
+                "scheduler": "plateau",
                 "lr_scale": 0.85,
                 "weight_decay": 2e-2,
                 "label_smoothing": 0.10,
                 "mixup_alpha": 0.10 if self.num_classes > 2 else 0.0,
+                "dropout_scale": 1.50,
                 "use_class_weights": False,
             },
         ]
@@ -143,10 +159,13 @@ class NAS:
             recipes.append(
                 {
                     "name": "balanced",
+                    "optimizer": "adamw",
+                    "scheduler": "plateau",
                     "lr_scale": 0.90,
                     "weight_decay": 1e-2,
                     "label_smoothing": 0.03,
                     "mixup_alpha": 0.0,
+                    "dropout_scale": 1.0,
                     "use_class_weights": True,
                 }
             )
@@ -154,23 +173,46 @@ class NAS:
             recipes.append(
                 {
                     "name": "fast_fit",
+                    "optimizer": "adamw",
+                    "scheduler": "plateau",
                     "lr_scale": 1.20,
                     "weight_decay": 5e-3,
                     "label_smoothing": 0.03,
                     "mixup_alpha": 0.0,
+                    "dropout_scale": 0.50,
                     "use_class_weights": False,
                 }
             )
+        recipes.append(
+            {
+                "name": "sgd_nesterov",
+                "optimizer": "sgd",
+                "scheduler": "cosine",
+                "search_lr": 2e-2,
+                "final_lr": 2e-2,
+                "lr_scale": 1.0,
+                "momentum": 0.9,
+                "nesterov": True,
+                "weight_decay": 5e-4,
+                "label_smoothing": 0.0,
+                "mixup_alpha": 0.0,
+                "dropout_scale": 1.0,
+                "use_class_weights": imbalance >= 1.75,
+            }
+        )
         return recipes
 
     def _architecture_search_recipe(self):
         """Use one neutral recipe so architecture and recipe are not confounded."""
         return {
             "name": "architecture_probe",
+            "optimizer": "adamw",
+            "scheduler": "plateau",
             "lr_scale": 1.0,
             "weight_decay": 1e-2,
             "label_smoothing": 0.0,
             "mixup_alpha": 0.0,
+            "dropout_scale": 1.0,
             "use_class_weights": (
                 float(self.data_props.get("class_imbalance_ratio", 1.0))
                 >= 1.75
@@ -271,6 +313,15 @@ class NAS:
 
     def _attach_recipe(self, model, recipe):
         model.training_recipe = dict(recipe)
+        scale = float(recipe.get("dropout_scale", 1.0))
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                if not hasattr(module, "_nas_base_dropout"):
+                    module._nas_base_dropout = float(module.p)
+                module.p = min(
+                    0.60,
+                    max(0.0, module._nas_base_dropout * scale),
+                )
         return model
 
     def _tier3_fallback(self):
@@ -409,10 +460,13 @@ class NAS:
                     "params": params,
                     "recipe": {
                         "name": "architecture_probe",
+                        "optimizer": "adamw",
+                        "scheduler": "plateau",
                         "lr_scale": 1.0,
                         "weight_decay": 1e-2,
                         "label_smoothing": 0.0,
                         "mixup_alpha": 0.0,
+                        "dropout_scale": 1.0,
                         "use_class_weights": False,
                     },
                 }
@@ -436,12 +490,30 @@ class NAS:
                 data.numel() * data.element_size()
                 + target.numel() * target.element_size()
             )
-            if cached and used + batch_bytes > byte_budget:
+            remaining_bytes = byte_budget - used
+            if remaining_bytes <= 0:
                 break
+            if batch_bytes > remaining_bytes:
+                bytes_per_example = max(
+                    1, batch_bytes // max(1, data.size(0))
+                )
+                fitting = int(remaining_bytes // bytes_per_example)
+                if fitting <= 0:
+                    break
+                data = data[:fitting]
+                target = target[:fitting]
+                batch_bytes = (
+                    data.numel() * data.element_size()
+                    + target.numel() * target.element_size()
+                )
             cached.append(
                 (data.detach().cpu().clone(), target.detach().cpu().clone())
             )
             used += batch_bytes
+            if data.size(0) < getattr(
+                self.train_loader, "batch_size", data.size(0)
+            ):
+                break
             if len(cached) >= min(max_batches, len(self.train_loader)):
                 break
         print(
@@ -452,33 +524,14 @@ class NAS:
         )
         return cached
 
-    def _cache_validation_batches(self, max_samples=4096):
-        dataset = getattr(self.valid_loader, "dataset", None)
-        labels = getattr(dataset, "y", None)
-        if dataset is None or labels is None or len(dataset) == 0:
+    @staticmethod
+    def _materialize_validation_subset(dataset, indices, batch_size):
+        if not indices:
             return []
-        labels = labels.detach().cpu().numpy()
-        classes = np.unique(labels)
-        selected = []
-        base = max_samples // max(1, len(classes))
-        remainder = max_samples % max(1, len(classes))
-        for class_index, class_id in enumerate(classes):
-            positions = np.flatnonzero(labels == class_id)
-            quota = min(
-                len(positions),
-                base + (1 if class_index < remainder else 0),
-            )
-            if quota:
-                offsets = np.linspace(
-                    0, len(positions) - 1, quota, dtype=np.int64
-                )
-                selected.extend(positions[offsets].tolist())
-        if not selected:
-            return []
-        subset = torch.utils.data.Subset(dataset, sorted(selected))
+        subset = torch.utils.data.Subset(dataset, sorted(indices))
         loader = torch.utils.data.DataLoader(
             subset,
-            batch_size=getattr(self.valid_loader, "batch_size", 128) or 128,
+            batch_size=batch_size,
             shuffle=False,
             drop_last=False,
             num_workers=0,
@@ -487,6 +540,167 @@ class NAS:
             (data.detach().cpu().clone(), target.detach().cpu().clone())
             for data, target in loader
         ]
+
+    def _cache_validation_splits(
+        self,
+        max_samples=4096,
+        max_megabytes=64,
+        confirmation_fraction=0.25,
+    ):
+        """Cache prior-preserving selection and untouched confirmation sets."""
+        dataset = getattr(self.valid_loader, "dataset", None)
+        labels = getattr(dataset, "y", None)
+        if dataset is None or labels is None or len(dataset) == 0:
+            return [], []
+        labels = labels.detach().cpu().numpy()
+        classes = np.unique(labels)
+        sample_tensor = getattr(dataset, "x", None)
+        if sample_tensor is not None and sample_tensor.ndim >= 2:
+            output_elements = int(np.prod(sample_tensor.shape[1:]))
+        else:
+            output_elements = (
+                self.in_channels * self.input_h * self.input_w
+            )
+        bytes_per_sample = max(1, 4 * output_elements + 8)
+        byte_limited = max(
+            1, int(max_megabytes * 1024 * 1024) // bytes_per_sample
+        )
+        target_samples = min(
+            len(dataset), int(max_samples), byte_limited
+        )
+        class_counts = np.asarray(
+            [np.sum(labels == class_id) for class_id in classes],
+            dtype=np.int64,
+        )
+        exact_quotas = class_counts * (
+            float(target_samples) / max(1, len(dataset))
+        )
+        quotas = np.floor(exact_quotas).astype(np.int64)
+        remainder = target_samples - int(quotas.sum())
+        fractional_order = np.argsort(
+            -(exact_quotas - quotas), kind="stable"
+        )
+        for class_index in fractional_order[:remainder]:
+            quotas[class_index] += 1
+
+        selection_indices = []
+        confirmation_indices = []
+        for class_index, class_id in enumerate(classes):
+            positions = np.flatnonzero(labels == class_id)
+            quota = min(len(positions), int(quotas[class_index]))
+            if quota:
+                offsets = np.linspace(
+                    0, len(positions) - 1, quota, dtype=np.int64
+                )
+                chosen = positions[offsets].tolist()
+                confirmation_count = (
+                    max(1, int(round(quota * confirmation_fraction)))
+                    if quota >= 2
+                    else 0
+                )
+                confirmation_offsets = set(
+                    np.linspace(
+                        0,
+                        quota - 1,
+                        confirmation_count,
+                        dtype=np.int64,
+                    ).tolist()
+                )
+                confirmation = [
+                    value
+                    for offset, value in enumerate(chosen)
+                    if offset in confirmation_offsets
+                ]
+                selection = [
+                    value
+                    for offset, value in enumerate(chosen)
+                    if offset not in confirmation_offsets
+                ]
+                confirmation_indices.extend(confirmation)
+                selection_indices.extend(selection)
+
+        # A tiny validation split may not support a separate confirmation
+        # sample. In that case retain the prior-preserving selection set.
+        if not selection_indices:
+            selection_indices = confirmation_indices
+            confirmation_indices = []
+        batch_size = (
+            getattr(self.valid_loader, "batch_size", 128) or 128
+        )
+        selection_batches = self._materialize_validation_subset(
+            dataset, selection_indices, batch_size
+        )
+        confirmation_batches = self._materialize_validation_subset(
+            dataset, confirmation_indices, batch_size
+        )
+        self.metadata["nas_selection_samples"] = len(selection_indices)
+        self.metadata["nas_confirmation_samples"] = len(
+            confirmation_indices
+        )
+        self.metadata["nas_validation_cache_megabytes"] = (
+            target_samples * bytes_per_sample / (1024.0 * 1024.0)
+        )
+        print(
+            "  [NAS] Validation split: {} selection + {} confirmation "
+            "samples ({:.1f} MiB cap use)".format(
+                len(selection_indices),
+                len(confirmation_indices),
+                self.metadata["nas_validation_cache_megabytes"],
+            )
+        )
+        return selection_batches, confirmation_batches
+
+    def _cache_validation_batches(self, max_samples=4096):
+        """Backward-compatible selection-cache accessor used by tests."""
+        selection, _ = self._cache_validation_splits(
+            max_samples=max_samples
+        )
+        return selection
+
+    def _calibrate_search_microbatch(
+        self, space, cached_batches, deadline_remaining
+    ):
+        """Exercise one compact update so OOM fallback is fixed before racing."""
+        if not cached_batches:
+            return
+        logical_batch = int(cached_batches[0][1].size(0))
+        self.search_microbatch_size = logical_batch
+        if self.device.type != "cuda":
+            self.metadata["nas_search_microbatch_size"] = logical_batch
+            return
+        if self.clock.check() <= deadline_remaining + 12:
+            return
+        spec = self._anchor_spec(self._fallback_family(space), space)
+        model = space.build_model(spec)
+        try:
+            self._seed_everything(self.seed + 71)
+            self._train_low_fidelity(
+                model,
+                cached_batches[:1],
+                max_steps=1,
+                time_quantum=min(
+                    12.0,
+                    max(
+                        2.0,
+                        self.clock.check() - deadline_remaining - 10.0,
+                    ),
+                ),
+                deadline_remaining=deadline_remaining,
+                recipe=self._architecture_search_recipe(),
+            )
+        finally:
+            model.cpu()
+            del model
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        self.metadata["nas_search_microbatch_size"] = int(
+            self.search_microbatch_size
+        )
+        print(
+            "  [NAS] Calibrated logical/microbatch: {}/{}".format(
+                logical_batch, self.search_microbatch_size
+            )
+        )
 
     def _make_refinement_loader(self):
         """Deterministic full-data stream for the last two candidates."""
@@ -510,6 +724,422 @@ class NAS:
             num_workers=0,
             pin_memory=self.device.type == "cuda",
         )
+
+    def _policy_probe_batches(self, max_batches=24):
+        """Materialize the same deterministic examples under the active policy."""
+        dataset = getattr(self.train_loader, "dataset", None)
+        if dataset is None or len(dataset) == 0:
+            return []
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + 59)
+        indices = torch.randperm(
+            len(dataset), generator=generator
+        ).tolist()
+        batch_size = int(
+            getattr(self.train_loader, "batch_size", 128) or 128
+        )
+        sample_limit = min(
+            len(indices), max(1, int(max_batches)) * batch_size
+        )
+        loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, indices[:sample_limit]),
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=0,
+        )
+        return [
+            (data.detach().cpu().clone(), target.detach().cpu().clone())
+            for data, target in loader
+        ]
+
+    def _select_augmentation_policy(
+        self,
+        space,
+        validation_batches,
+        deadline_remaining,
+    ):
+        """Run an incumbent-safe compact functional probe over safe policies."""
+        dataset = getattr(self.train_loader, "dataset", None)
+        policies = getattr(dataset, "augmentation_policies", {})
+        current = getattr(dataset, "augmentation_policy", "identity")
+        if (
+            dataset is None
+            or not hasattr(dataset, "set_augmentation_policy")
+            or len(policies) <= 1
+            or not validation_batches
+        ):
+            return current
+        available = self.clock.check() - deadline_remaining - 12.0
+        if available < max(12.0, 3.0 * len(policies)):
+            return current
+
+        spec = self._anchor_spec(self._fallback_family(space), space)
+        common_model = space.build_model(spec)
+        common_state = {
+            key: value.detach().cpu().clone()
+            for key, value in common_model.state_dict().items()
+        }
+        del common_model
+        recipe = self._architecture_search_recipe()
+        quantum = max(
+            2.0,
+            min(12.0, 0.16 * available / max(1, len(policies))),
+        )
+        results = []
+        print(
+            "  [NAS] Functional augmentation probe: {}".format(
+                ",".join(policies)
+            )
+        )
+        try:
+            for index, name in enumerate(policies):
+                if self.clock.check() <= deadline_remaining + 10:
+                    break
+                dataset.set_augmentation_policy(name)
+                self._seed_everything(self.seed + 600)
+                batches = self._policy_probe_batches(max_batches=24)
+                if not batches:
+                    continue
+                model = space.build_model(spec)
+                model.load_state_dict(common_state)
+                (
+                    steps,
+                    _,
+                    failed,
+                    _,
+                    train_stats,
+                ) = self._train_low_fidelity(
+                    model,
+                    batches,
+                    max_steps=max(8, min(24, len(batches))),
+                    time_quantum=quantum,
+                    deadline_remaining=deadline_remaining,
+                    recipe=recipe,
+                )
+                if failed or steps == 0:
+                    model.cpu()
+                    del model
+                    continue
+                metrics = self._evaluate(model, validation_batches)
+                model.cpu()
+                del model
+                results.append(
+                    {
+                        "name": name,
+                        "accuracy": float(metrics["accuracy"]),
+                        "loss": float(metrics["loss"]),
+                        "samples": int(metrics["samples"]),
+                        "train_accuracy": float(
+                            train_stats.get("train_accuracy", 0.0)
+                        ),
+                    }
+                )
+                print(
+                    "    {} | val={:.2f}% loss={:.4f} steps={}".format(
+                        name,
+                        metrics["accuracy"] * 100,
+                        metrics["loss"],
+                        steps,
+                    )
+                )
+        finally:
+            dataset.set_augmentation_policy(current)
+
+        incumbent = next(
+            (result for result in results if result["name"] == current),
+            None,
+        )
+        if incumbent is None:
+            return current
+        best = max(
+            results,
+            key=lambda result: (
+                result["accuracy"],
+                -result["loss"],
+            ),
+        )
+        margin = self._recipe_acceptance_margin(incumbent["samples"])
+        accuracy_gain = best["accuracy"] - incumbent["accuracy"]
+        relative_loss_gain = (
+            incumbent["loss"] - best["loss"]
+        ) / max(1e-8, abs(incumbent["loss"]))
+        accepted = (
+            accuracy_gain + 1e-12 >= margin
+            or (
+                accuracy_gain >= -margin
+                and relative_loss_gain >= 0.01
+            )
+        )
+        selected = best["name"] if accepted else current
+        dataset.set_augmentation_policy(selected)
+        self.metadata["augmentation_policy"] = selected
+        self.metadata["augmentation_probe"] = results
+        print(
+            "  [NAS] Augmentation policy: {}{}".format(
+                selected,
+                " (incumbent retained)" if selected == current else "",
+            )
+        )
+        return selected
+
+    @staticmethod
+    def _family_probe_score(probe):
+        history = probe.get("metrics_history", [])
+        latest = history[-1]
+        first = history[0]
+        relative_loss_gain = (
+            float(first["loss"]) - float(latest["loss"])
+        ) / max(1e-8, abs(float(first["loss"])))
+        train_accuracy = float(
+            probe.get("train_stats", {}).get("train_accuracy", 0.0)
+        )
+        gap = max(0.0, train_accuracy - float(latest["accuracy"]))
+        samples = max(1, int(latest.get("samples", 1)))
+        accuracy = float(latest["accuracy"])
+        uncertainty = math.sqrt(
+            max(1e-8, accuracy * (1.0 - accuracy)) / samples
+        )
+        score = (
+            accuracy
+            + min(0.01, 0.025 * max(-0.20, relative_loss_gain))
+            + min(0.006, 0.50 * uncertainty)
+            - 0.006 * min(0.50, gap)
+        )
+        probe["loss_slope"] = relative_loss_gain
+        probe["train_validation_gap"] = gap
+        probe["probe_score"] = score
+        return score
+
+    def _representation_probe_race(
+        self,
+        space,
+        ranked,
+        cached_batches,
+        validation_batches,
+        deadline_remaining,
+    ):
+        """Promote representation families before racing macro dimensions."""
+        family_entries = {}
+        for entry in ranked:
+            family_entries.setdefault(
+                entry["spec"].model_family, []
+            ).append(entry)
+        families = list(family_entries)
+        if len(families) <= 2 or not cached_batches or not validation_batches:
+            return set(families)
+        available = self.clock.check() - deadline_remaining - 12.0
+        if available < max(18.0, 2.5 * len(families)):
+            return set(families)
+
+        recipe = self._architecture_search_recipe()
+        stage_steps = max(
+            8, min(len(cached_batches), int(math.ceil(len(cached_batches) / 2)))
+        )
+        probe_budget = min(
+            0.32 * available,
+            max(18.0, 7.0 * len(families)),
+        )
+        stage_one_quantum = max(
+            2.0, 0.55 * probe_budget / max(1, len(families))
+        )
+        probes = []
+        print(
+            "  [NAS] Representation probe race: {} families, "
+            "{} progressive steps/stage".format(
+                len(families), stage_steps
+            )
+        )
+        for index, family in enumerate(families):
+            if self.clock.check() <= deadline_remaining + 10:
+                break
+            entries = family_entries[family]
+            anchor = self._anchor_spec(family, space)
+            entry = min(
+                entries,
+                key=lambda item: (
+                    item["spec"] != anchor,
+                    item["params"],
+                ),
+            )
+            self._seed_everything(self.seed + 1200 + index)
+            model = self._attach_recipe(
+                space.build_model(entry["spec"]), recipe
+            )
+            initial = self._evaluate(model, validation_batches)
+            (
+                steps,
+                elapsed,
+                failed,
+                optimizer_state,
+                train_stats,
+            ) = self._train_low_fidelity(
+                model,
+                cached_batches,
+                stage_steps,
+                stage_one_quantum,
+                deadline_remaining,
+                recipe,
+                start_step=0,
+            )
+            if failed or steps == 0:
+                model.cpu()
+                del model
+                continue
+            metrics = self._evaluate(model, validation_batches)
+            probe = {
+                "family": family,
+                "entry": entry,
+                "model": model,
+                "optimizer_state": optimizer_state,
+                "steps": steps,
+                "elapsed": elapsed,
+                "data_cursor": steps,
+                "metrics_history": [initial, metrics],
+                "train_stats": train_stats,
+            }
+            self._family_probe_score(probe)
+            model.cpu()
+            probes.append(probe)
+            print(
+                "    {} | val={:.2f}% loss={:.4f} slope={:+.3f}".format(
+                    family,
+                    metrics["accuracy"] * 100,
+                    metrics["loss"],
+                    probe["loss_slope"],
+                )
+            )
+
+        if len(probes) < 2:
+            for probe in probes:
+                del probe["model"]
+            return set(families)
+        probes.sort(key=lambda item: item["probe_score"], reverse=True)
+        promoted = probes[:2]
+        if len(probes) >= 3:
+            second_metrics = promoted[-1]["metrics_history"][-1]
+            third_metrics = probes[2]["metrics_history"][-1]
+            samples = max(
+                1,
+                min(
+                    int(second_metrics.get("samples", 1)),
+                    int(third_metrics.get("samples", 1)),
+                ),
+            )
+            threshold = max(
+                1.0 / samples,
+                min(
+                    0.01,
+                    math.sqrt(
+                        max(
+                            1e-8,
+                            float(second_metrics["accuracy"])
+                            * (1.0 - float(second_metrics["accuracy"]))
+                            / samples,
+                        )
+                    ),
+                ),
+            )
+            if (
+                promoted[-1]["probe_score"] - probes[2]["probe_score"]
+                <= threshold
+            ):
+                promoted.append(probes[2])
+
+        stage_two_quantum = max(
+            2.0,
+            0.40 * probe_budget / max(1, len(promoted)),
+        )
+        completed = []
+        for index, probe in enumerate(promoted):
+            if self.clock.check() <= deadline_remaining + 9:
+                break
+            self._seed_everything(self.seed + 2200 + index)
+            (
+                steps,
+                elapsed,
+                failed,
+                optimizer_state,
+                train_stats,
+            ) = self._train_low_fidelity(
+                probe["model"],
+                cached_batches,
+                stage_steps,
+                stage_two_quantum,
+                deadline_remaining,
+                recipe,
+                probe["optimizer_state"],
+                start_step=probe["data_cursor"],
+            )
+            if failed or steps == 0:
+                continue
+            metrics = self._evaluate(probe["model"], validation_batches)
+            probe["optimizer_state"] = optimizer_state
+            probe["steps"] += steps
+            probe["elapsed"] += elapsed
+            probe["data_cursor"] += steps
+            probe["train_stats"] = train_stats
+            probe["metrics_history"].append(metrics)
+            self._family_probe_score(probe)
+            completed.append(probe)
+            print(
+                "    promoted {} | val={:.2f}% loss={:.4f} "
+                "total_steps={}".format(
+                    probe["family"],
+                    metrics["accuracy"] * 100,
+                    metrics["loss"],
+                    probe["steps"],
+                )
+            )
+
+        selected_probes = completed if len(completed) >= 2 else promoted
+        selected_probes.sort(
+            key=lambda item: item["probe_score"], reverse=True
+        )
+        selected_families = {
+            probe["family"] for probe in selected_probes[:2]
+        }
+        if len(selected_probes) >= 3:
+            first = selected_probes[1]["metrics_history"][-1]
+            second = selected_probes[2]["metrics_history"][-1]
+            samples = max(
+                1,
+                min(
+                    int(first.get("samples", 1)),
+                    int(second.get("samples", 1)),
+                ),
+            )
+            tie = max(1.0 / samples, 0.005)
+            if (
+                selected_probes[1]["probe_score"]
+                - selected_probes[2]["probe_score"]
+                <= tie
+            ):
+                selected_families.add(selected_probes[2]["family"])
+        for probe in probes:
+            probe["model"].cpu()
+            del probe["model"]
+        self.metadata["nas_promoted_families"] = sorted(
+            selected_families
+        )
+        self.metadata["nas_family_probe_results"] = [
+            {
+                "family": probe["family"],
+                "score": float(probe["probe_score"]),
+                "steps": int(probe["steps"]),
+                "loss_slope": float(probe["loss_slope"]),
+                "train_validation_gap": float(
+                    probe["train_validation_gap"]
+                ),
+            }
+            for probe in probes
+        ]
+        print(
+            "  [NAS] Promoted representation families: {}".format(
+                ",".join(sorted(selected_families))
+            )
+        )
+        return selected_families
 
     def _proxy_screen(self, space, candidates, inputs, deadline_remaining):
         evaluated = []
@@ -681,6 +1311,24 @@ class NAS:
         mixed = coefficient * data + (1.0 - coefficient) * data[permutation]
         return mixed, target, target[permutation], coefficient
 
+    def _make_search_optimizer(self, model, recipe):
+        optimizer_name = str(recipe.get("optimizer", "adamw")).lower()
+        if optimizer_name == "sgd":
+            return torch.optim.SGD(
+                model.parameters(),
+                lr=float(recipe.get("search_lr", 2e-2))
+                * float(recipe.get("lr_scale", 1.0)),
+                momentum=float(recipe.get("momentum", 0.9)),
+                nesterov=bool(recipe.get("nesterov", True)),
+                weight_decay=float(recipe.get("weight_decay", 5e-4)),
+            )
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=float(recipe.get("search_lr", 1e-3))
+            * float(recipe.get("lr_scale", 1.0)),
+            weight_decay=float(recipe.get("weight_decay", 1e-2)),
+        )
+
     def _train_low_fidelity(
         self,
         model,
@@ -690,28 +1338,49 @@ class NAS:
         deadline_remaining,
         recipe,
         optimizer_state=None,
+        start_step=0,
     ):
         model.to(self.device)
         model.train()
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=1e-3 * float(recipe.get("lr_scale", 1.0)),
-            weight_decay=float(recipe.get("weight_decay", 1e-2)),
-        )
+        optimizer = self._make_search_optimizer(model, recipe)
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
             for state in optimizer.state.values():
                 for key, value in state.items():
                     if torch.is_tensor(value):
                         state[key] = value.to(self.device)
+        cosine_search = (
+            str(recipe.get("scheduler", "plateau")).lower() == "cosine"
+        )
+        if cosine_search:
+            segment_start_lr = float(
+                recipe.get("search_lr", 2e-2)
+            ) * float(recipe.get("lr_scale", 1.0))
+            for group in optimizer.param_groups:
+                group["lr"] = segment_start_lr
+        else:
+            segment_start_lr = 0.0
         criterion = self._criterion(recipe)
         scaler = torch.cuda.amp.GradScaler(enabled=self.device.type == "cuda")
         completed = 0
+        examples_seen = 0
+        train_correct = 0.0
+        train_loss_sum = 0.0
         started = time.perf_counter()
         failed = False
         saved_optimizer_state = None
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
         is_cached = isinstance(batch_source, (list, tuple))
         batch_iterator = None if is_cached else iter(batch_source)
+        if not is_cached and start_step and len(batch_source):
+            skip = int(start_step) % len(batch_source)
+            for _ in range(skip):
+                try:
+                    next(batch_iterator)
+                except StopIteration:
+                    batch_iterator = iter(batch_source)
+                    next(batch_iterator)
         try:
             for step in range(max_steps):
                 if (
@@ -720,41 +1389,139 @@ class NAS:
                 ):
                     break
                 if is_cached:
-                    data, target = batch_source[step % len(batch_source)]
+                    data, target = batch_source[
+                        (int(start_step) + step) % len(batch_source)
+                    ]
                 else:
                     try:
                         data, target = next(batch_iterator)
                     except StopIteration:
                         batch_iterator = iter(batch_source)
                         data, target = next(batch_iterator)
-                data = data.to(
-                    self.device, non_blocking=self.device.type == "cuda"
-                )
-                target = target.to(
-                    self.device, non_blocking=self.device.type == "cuda"
-                )
-                data, first, second, coefficient = self._mixup(
-                    data,
-                    target,
-                    float(recipe.get("mixup_alpha", 0.0)),
-                )
-                optimizer.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(
-                    enabled=self.device.type == "cuda"
-                ):
-                    output = model(data)
-                    loss = (
-                        coefficient * criterion(output, first)
-                        + (1.0 - coefficient) * criterion(output, second)
+                logical_batch_size = int(target.size(0))
+                configured_microbatch = int(
+                    getattr(
+                        self,
+                        "search_microbatch_size",
+                        logical_batch_size,
                     )
-                if not torch.isfinite(loss):
+                )
+                microbatch_size = max(
+                    1, min(logical_batch_size, configured_microbatch)
+                )
+                batch_correct = 0.0
+                batch_loss_sum = 0.0
+                batch_completed = False
+                while not batch_completed:
+                    optimizer.zero_grad(set_to_none=True)
+                    batch_correct = 0.0
+                    batch_loss_sum = 0.0
+                    finite_batch = True
+                    try:
+                        for micro_start in range(
+                            0, logical_batch_size, microbatch_size
+                        ):
+                            micro_end = min(
+                                logical_batch_size,
+                                micro_start + microbatch_size,
+                            )
+                            micro_data = data[
+                                micro_start:micro_end
+                            ].to(
+                                self.device,
+                                non_blocking=self.device.type == "cuda",
+                            )
+                            micro_target = target[
+                                micro_start:micro_end
+                            ].to(
+                                self.device,
+                                non_blocking=self.device.type == "cuda",
+                            )
+                            (
+                                mixed,
+                                first,
+                                second,
+                                coefficient,
+                            ) = self._mixup(
+                                micro_data,
+                                micro_target,
+                                float(recipe.get("mixup_alpha", 0.0)),
+                            )
+                            with torch.cuda.amp.autocast(
+                                enabled=self.device.type == "cuda"
+                            ):
+                                output = model(mixed)
+                                loss = (
+                                    coefficient
+                                    * criterion(output, first)
+                                    + (1.0 - coefficient)
+                                    * criterion(output, second)
+                                )
+                            if not torch.isfinite(loss):
+                                finite_batch = False
+                                break
+                            weight = (
+                                float(micro_end - micro_start)
+                                / logical_batch_size
+                            )
+                            scaler.scale(loss * weight).backward()
+                            predictions = output.detach().argmax(dim=1)
+                            batch_correct += float(
+                                coefficient
+                                * (predictions == first).sum().item()
+                                + (1.0 - coefficient)
+                                * (predictions == second).sum().item()
+                            )
+                            batch_loss_sum += (
+                                float(loss.detach().item())
+                                * (micro_end - micro_start)
+                            )
+                            del micro_data, micro_target, mixed, output, loss
+                        if not finite_batch:
+                            optimizer.zero_grad(set_to_none=True)
+                            break
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), 5.0
+                        )
+                        scaler.step(optimizer)
+                        scaler.update()
+                        batch_completed = True
+                    except RuntimeError as error:
+                        if not self._is_oom(error):
+                            raise
+                        optimizer.zero_grad(set_to_none=True)
+                        if self.device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        if microbatch_size <= 1:
+                            raise
+                        previous = microbatch_size
+                        microbatch_size = max(1, microbatch_size // 2)
+                        self.search_microbatch_size = microbatch_size
+                        self.metadata["nas_search_microbatch_size"] = (
+                            microbatch_size
+                        )
+                        print(
+                            "    [NAS] Search microbatch {} -> {} after OOM".format(
+                                previous, microbatch_size
+                            )
+                        )
+                if not batch_completed:
                     continue
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                scaler.step(optimizer)
-                scaler.update()
                 completed += 1
+                if cosine_search:
+                    progress = min(
+                        1.0, completed / max(1, int(max_steps))
+                    )
+                    minimum_lr = 0.02 * segment_start_lr
+                    learning_rate = minimum_lr + 0.5 * (
+                        segment_start_lr - minimum_lr
+                    ) * (1.0 + math.cos(math.pi * progress))
+                    for group in optimizer.param_groups:
+                        group["lr"] = learning_rate
+                examples_seen += logical_batch_size
+                train_correct += batch_correct
+                train_loss_sum += batch_loss_sum
         except RuntimeError as error:
             if not self._is_oom(error):
                 raise
@@ -771,11 +1538,29 @@ class NAS:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
         self._sync(self.device)
+        final_lr = 0.0
+        if saved_optimizer_state:
+            groups = saved_optimizer_state.get("param_groups", [])
+            if groups:
+                final_lr = float(groups[0].get("lr", 0.0))
+        train_stats = {
+            "examples_seen": examples_seen,
+            "train_accuracy": train_correct / max(1, examples_seen),
+            "train_loss": train_loss_sum / max(1, examples_seen),
+            "final_lr": final_lr,
+            "peak_memory_mb": (
+                torch.cuda.max_memory_allocated(self.device)
+                / (1024.0 * 1024.0)
+                if self.device.type == "cuda"
+                else 0.0
+            ),
+        }
         return (
             completed,
             max(1e-4, time.perf_counter() - started),
             failed,
             saved_optimizer_state,
+            train_stats,
         )
 
     def _evaluate(self, model, source=None):
@@ -784,6 +1569,7 @@ class NAS:
         correct = 0
         total = 0
         total_loss = 0.0
+        total_margin = 0.0
         class_correct = torch.zeros(self.num_classes, dtype=torch.long)
         class_total = torch.zeros(self.num_classes, dtype=torch.long)
         with torch.no_grad():
@@ -803,6 +1589,15 @@ class NAS:
                         output.float(), target, reduction="sum"
                     ).item()
                 )
+                if output.size(1) >= 2:
+                    top_two = torch.topk(
+                        torch.softmax(output.float(), dim=1),
+                        k=2,
+                        dim=1,
+                    ).values
+                    total_margin += float(
+                        (top_two[:, 0] - top_two[:, 1]).sum().item()
+                    )
                 predictions = output.argmax(dim=1)
                 matches = predictions == target
                 correct += int(matches.sum().item())
@@ -832,6 +1627,7 @@ class NAS:
             "accuracy": correct / max(1, total),
             "balanced_accuracy": balanced,
             "loss": total_loss / max(1, total),
+            "margin": total_margin / max(1, total),
             "samples": total,
         }
 
@@ -848,6 +1644,13 @@ class NAS:
         projected_epochs = float(entry.get("projected_epochs", 0.0))
         history = entry.get("val_history", [])
         gain = max(0.0, history[-1] - history[-2]) if len(history) >= 2 else 0.0
+        loss_history = entry.get("val_loss_history", [])
+        relative_loss_gain = (
+            max(0.0, loss_history[-2] - loss_history[-1])
+            / max(1e-8, abs(loss_history[-2]))
+            if len(loss_history) >= 2
+            else 0.0
+        )
         consistency = (
             sum(history[-3:]) / min(3, len(history))
             if history
@@ -857,10 +1660,16 @@ class NAS:
             max(0.0, seconds_per_step * 1000.0)
         )
         epoch_penalty = 0.0015 * max(0.0, 12.0 - projected_epochs)
+        samples = max(1, int(entry.get("val_samples", 1)))
+        uncertainty = math.sqrt(
+            max(1e-8, accuracy * (1.0 - accuracy)) / samples
+        )
         return (
-            0.90 * validation_score
-            + 0.10 * consistency
+            0.88 * validation_score
+            + 0.09 * consistency
             + min(0.003, 0.10 * gain)
+            + min(0.003, 0.02 * relative_loss_gain)
+            + min(0.002, 0.25 * uncertainty)
             - latency_penalty
             - epoch_penalty
         )
@@ -912,6 +1721,22 @@ class NAS:
         """Blend final accuracy, preceding fidelity and rank consistency."""
         rank_scores = self._history_rank_scores(entries)
         for entry in entries:
+            if "confirmation_val_acc" in entry:
+                selection_accuracy = float(
+                    entry.get(
+                        "selection_val_acc",
+                        entry.get("val_acc", 0.0),
+                    )
+                )
+                confirmation_accuracy = float(
+                    entry["confirmation_val_acc"]
+                )
+                entry["selection_score"] = (
+                    0.80 * confirmation_accuracy
+                    + 0.15 * selection_accuracy
+                    + 0.05 * rank_scores.get(id(entry), 0.5)
+                )
+                continue
             full_score = float(
                 entry.get("full_val_acc", entry.get("val_acc", 0.0))
             )
@@ -943,8 +1768,20 @@ class NAS:
         # remains accuracy-based, but a still-improving recipe should survive
         # a tiny early accuracy deficit.
         bounded_slope = max(-0.25, min(0.25, loss_slope))
-        score = float(trial.get("best_val_acc", 0.0)) + 0.01 * bounded_slope
+        latest = history[-1] if history else {}
+        generalization_gap = max(
+            0.0,
+            float(latest.get("train_accuracy", 0.0))
+            - float(latest.get("accuracy", 0.0)),
+        )
+        gap_penalty = 0.01 * min(0.50, generalization_gap)
+        score = (
+            float(trial.get("best_val_acc", 0.0))
+            + 0.01 * bounded_slope
+            - gap_penalty
+        )
         trial["loss_slope"] = loss_slope
+        trial["train_validation_gap"] = generalization_gap
         trial["selection_score"] = score
         return score
 
@@ -966,6 +1803,7 @@ class NAS:
         refinement_loader,
         validation_batches,
         deadline_remaining,
+        confirmation_batches=None,
     ):
         """Run an incumbent-safe, two-stage race from one checkpoint."""
         recipes = self._training_recipes()
@@ -1078,6 +1916,7 @@ class NAS:
                 elapsed,
                 failed,
                 optimizer_state,
+                train_stats,
             ) = self._train_low_fidelity(
                 model,
                 refinement_loader,
@@ -1108,6 +1947,9 @@ class NAS:
                     {
                         "accuracy": trial_accuracy,
                         "loss": trial_loss,
+                        "train_accuracy": float(
+                            train_stats.get("train_accuracy", 0.0)
+                        ),
                     },
                 ],
                 "best_val_acc": trial_accuracy,
@@ -1118,6 +1960,7 @@ class NAS:
                 "best_steps": steps,
                 "best_elapsed": elapsed,
                 "best_optimizer_state": copy.deepcopy(optimizer_state),
+                "train_stats": dict(train_stats),
             }
             self._recipe_trial_score(trial)
             trials.append(trial)
@@ -1202,6 +2045,7 @@ class NAS:
                 elapsed,
                 failed,
                 optimizer_state,
+                train_stats,
             ) = self._train_low_fidelity(
                 model,
                 refinement_loader,
@@ -1210,6 +2054,7 @@ class NAS:
                 deadline_remaining,
                 trial["recipe"],
                 previous_optimizer_state,
+                start_step=previous_best_steps,
             )
             if failed or steps < stage_two_steps:
                 model.load_state_dict(best_state)
@@ -1225,6 +2070,9 @@ class NAS:
                 {
                     "accuracy": current_accuracy,
                     "loss": current_loss,
+                    "train_accuracy": float(
+                        train_stats.get("train_accuracy", 0.0)
+                    ),
                 }
             )
             is_better_checkpoint = (
@@ -1245,6 +2093,7 @@ class NAS:
                 trial["best_optimizer_state"] = copy.deepcopy(
                     optimizer_state
                 )
+                trial["train_stats"] = dict(train_stats)
             else:
                 model.load_state_dict(best_state)
                 trial["best_steps"] = previous_best_steps
@@ -1296,6 +2145,52 @@ class NAS:
                 )
             )
 
+        if confirmation_batches:
+            architecture_model.to(self.device)
+            confirmation_incumbent = self._evaluate(
+                architecture_model, confirmation_batches
+            )
+            architecture_model.cpu()
+            confirmation_accuracy = float(
+                confirmation_incumbent["accuracy"]
+            )
+            confirmation_margin = self._recipe_acceptance_margin(
+                confirmation_incumbent.get("samples", 0)
+            )
+            confirmed = []
+            for trial in eligible:
+                trial["model"].to(self.device)
+                metrics = self._evaluate(
+                    trial["model"], confirmation_batches
+                )
+                trial["model"].cpu()
+                trial["confirmation_val_acc"] = float(
+                    metrics["accuracy"]
+                )
+                trial["confirmation_val_loss"] = float(metrics["loss"])
+                if (
+                    trial["confirmation_val_acc"]
+                    - confirmation_accuracy
+                    + 1e-12
+                    >= confirmation_margin
+                ):
+                    confirmed.append(trial)
+            if not confirmed:
+                for trial in promoted:
+                    del trial["model"]
+                return restore_incumbent(
+                    "selection gain did not confirm on the held-out split"
+                )
+            confirmed.sort(
+                key=lambda item: (
+                    item["confirmation_val_acc"],
+                    -item["confirmation_val_loss"],
+                    item["selection_score"],
+                ),
+                reverse=True,
+            )
+            eligible = confirmed
+
         selected = eligible[0]
         for trial in promoted:
             if trial is not selected:
@@ -1316,7 +2211,9 @@ class NAS:
         ]
         architecture_winner["model"] = selected_model
         architecture_winner["recipe"] = dict(selected["recipe"])
-        architecture_winner["val_acc"] = selected["best_val_acc"]
+        architecture_winner["val_acc"] = selected.get(
+            "confirmation_val_acc", selected["best_val_acc"]
+        )
         architecture_winner["balanced_acc"] = selected[
             "best_balanced_acc"
         ]
@@ -1347,6 +2244,7 @@ class NAS:
         validation_batches,
         round_plan,
         deadline_remaining,
+        confirmation_batches=None,
     ):
         finalists = self._select_label_aware_entries(ranked, n_top)
         architecture_recipe = self._architecture_search_recipe()
@@ -1361,7 +2259,10 @@ class NAS:
             candidate["trained_steps"] = 0
             candidate["train_seconds"] = 0.0
             candidate["val_history"] = []
+            candidate["val_loss_history"] = []
             candidate["optimizer_state"] = None
+            candidate["data_cursor"] = 0
+            candidate["seed_schedule"] = []
             active.append(candidate)
 
         coverage_steps = max(1, len(cached_batches))
@@ -1397,14 +2298,19 @@ class NAS:
             for candidate_index, candidate in enumerate(active):
                 if self.clock.check() <= deadline_remaining + 6:
                     break
-                self._seed_everything(
-                    self.seed + 1000 * (round_index + 1) + candidate_index
+                candidate_seed = (
+                    self.seed
+                    + 1000 * (round_index + 1)
+                    + candidate_index
                 )
+                self._seed_everything(candidate_seed)
+                candidate["seed_schedule"].append(candidate_seed)
                 (
                     steps,
                     elapsed,
                     failed,
                     optimizer_state,
+                    train_stats,
                 ) = self._train_low_fidelity(
                     candidate["model"],
                     cached_batches,
@@ -1413,14 +2319,23 @@ class NAS:
                     deadline_remaining,
                     candidate["recipe"],
                     candidate.get("optimizer_state"),
+                    start_step=candidate.get("data_cursor", 0),
                 )
                 if failed or (steps == 0 and candidate["trained_steps"] == 0):
                     candidate["model"].cpu()
                     del candidate["model"]
                     continue
                 candidate["trained_steps"] += steps
+                candidate["data_cursor"] = int(
+                    candidate.get("data_cursor", 0)
+                ) + steps
                 candidate["optimizer_state"] = optimizer_state
+                candidate["train_stats"] = dict(train_stats)
                 candidate["train_seconds"] += elapsed
+                candidate["examples_per_second"] = (
+                    float(train_stats.get("examples_seen", 0))
+                    / max(1e-4, elapsed)
+                )
                 candidate["seconds_per_step"] = (
                     candidate["train_seconds"]
                     / max(1, candidate["trained_steps"])
@@ -1440,21 +2355,41 @@ class NAS:
                 )
                 candidate["val_acc"] = metrics["accuracy"]
                 candidate["balanced_acc"] = metrics["balanced_accuracy"]
+                candidate["val_loss"] = metrics["loss"]
+                candidate["val_margin"] = metrics["margin"]
+                candidate["val_samples"] = metrics["samples"]
+                candidate["examples_seen"] = int(
+                    candidate.get("examples_seen", 0)
+                ) + int(train_stats.get("examples_seen", 0))
+                candidate["peak_memory_mb"] = max(
+                    float(candidate.get("peak_memory_mb", 0.0)),
+                    float(train_stats.get("peak_memory_mb", 0.0)),
+                )
                 candidate["val_history"].append(candidate["val_acc"])
+                candidate["val_loss_history"].append(
+                    candidate["val_loss"]
+                )
                 self._adapt_search_lr(candidate)
                 candidate["utility"] = self._candidate_utility(candidate)
                 candidate["model"].cpu()
                 results.append(candidate)
                 print(
                     "    {}/{} {} + {} | val={:.2f}% bal={:.2f}% "
-                    "steps={} projected_epochs={:.1f}".format(
+                    "loss={:.4f} steps={} seed={} lr={:.1e} "
+                    "ex/s={:.1f} peak={:.0f}MiB "
+                    "projected_epochs={:.1f}".format(
                         candidate_index + 1,
                         len(active),
                         self._spec_label(candidate["spec"]),
                         candidate["recipe"]["name"],
                         candidate["val_acc"] * 100,
                         candidate["balanced_acc"] * 100,
+                        candidate["val_loss"],
                         candidate["trained_steps"],
+                        candidate_seed,
+                        train_stats.get("final_lr", 0.0),
+                        candidate["examples_per_second"],
+                        candidate["peak_memory_mb"],
                         candidate["projected_epochs"],
                     )
                 )
@@ -1542,14 +2477,22 @@ class NAS:
                     time_quantum = max(
                         5.0, 1.80 * seconds_per_step * common_steps
                     )
-                    self._seed_everything(
-                        self.seed + 8000 + 101 * pass_index + candidate_index
+                    candidate_seed = (
+                        self.seed
+                        + 8000
+                        + 101 * pass_index
+                        + candidate_index
+                    )
+                    self._seed_everything(candidate_seed)
+                    candidate.setdefault("seed_schedule", []).append(
+                        candidate_seed
                     )
                     (
                         steps,
                         elapsed,
                         failed,
                         optimizer_state,
+                        train_stats,
                     ) = self._train_low_fidelity(
                         candidate["model"],
                         refinement_loader,
@@ -1558,6 +2501,7 @@ class NAS:
                         refinement_floor,
                         candidate["recipe"],
                         candidate.get("optimizer_state"),
+                        start_step=candidate.get("data_cursor", 0),
                     )
                     if failed or steps == 0:
                         candidate["model"].cpu()
@@ -1565,7 +2509,11 @@ class NAS:
                         candidate.pop("optimizer_state", None)
                         continue
                     candidate["optimizer_state"] = optimizer_state
+                    candidate["train_stats"] = dict(train_stats)
                     candidate["trained_steps"] += steps
+                    candidate["data_cursor"] = int(
+                        candidate.get("data_cursor", 0)
+                    ) + steps
                     candidate["train_seconds"] += elapsed
                     candidate["seconds_per_step"] = (
                         candidate["train_seconds"]
@@ -1578,7 +2526,20 @@ class NAS:
                     candidate["balanced_acc"] = metrics[
                         "balanced_accuracy"
                     ]
+                    candidate["val_loss"] = metrics["loss"]
+                    candidate["val_margin"] = metrics["margin"]
+                    candidate["val_samples"] = metrics["samples"]
+                    candidate["examples_seen"] = int(
+                        candidate.get("examples_seen", 0)
+                    ) + int(train_stats.get("examples_seen", 0))
+                    candidate["peak_memory_mb"] = max(
+                        float(candidate.get("peak_memory_mb", 0.0)),
+                        float(train_stats.get("peak_memory_mb", 0.0)),
+                    )
                     candidate["val_history"].append(candidate["val_acc"])
+                    candidate["val_loss_history"].append(
+                        candidate["val_loss"]
+                    )
                     candidate["refinement_history"].append(
                         candidate["val_acc"]
                     )
@@ -1619,10 +2580,11 @@ class NAS:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        # The same complete validation split decides between the last
-        # challengers.  Earlier subset scores never compete directly with it.
+        # The last challengers are measured on the same prior-preserving
+        # selection source and, when available, an untouched confirmation
+        # source. Earlier adaptive scores never masquerade as confirmation.
         print(
-            "  [NAS] Full-validation champion/challenger comparison ({})".format(
+            "  [NAS] Selection/confirmation champion comparison ({})".format(
                 len(active)
             )
         )
@@ -1631,17 +2593,56 @@ class NAS:
             if self.clock.check() <= deadline_remaining + 4 and final_results:
                 break
             candidate["model"].to(self.device)
-            metrics = self._evaluate(candidate["model"], None)
-            candidate["full_val_acc"] = metrics["accuracy"]
-            candidate["val_acc"] = candidate["full_val_acc"]
-            candidate["balanced_acc"] = metrics["balanced_accuracy"]
+            selection_metrics = self._evaluate(
+                candidate["model"], validation_batches
+            )
+            candidate["selection_val_acc"] = selection_metrics["accuracy"]
+            candidate["selection_val_loss"] = selection_metrics["loss"]
+            candidate["val_acc"] = candidate["selection_val_acc"]
+            candidate["balanced_acc"] = selection_metrics[
+                "balanced_accuracy"
+            ]
+            if confirmation_batches:
+                confirmation_metrics = self._evaluate(
+                    candidate["model"], confirmation_batches
+                )
+                candidate["confirmation_val_acc"] = (
+                    confirmation_metrics["accuracy"]
+                )
+                candidate["confirmation_val_loss"] = (
+                    confirmation_metrics["loss"]
+                )
+                candidate["confirmation_samples"] = (
+                    confirmation_metrics["samples"]
+                )
+                total_samples = (
+                    selection_metrics["samples"]
+                    + confirmation_metrics["samples"]
+                )
+                candidate["full_val_acc"] = (
+                    selection_metrics["accuracy"]
+                    * selection_metrics["samples"]
+                    + confirmation_metrics["accuracy"]
+                    * confirmation_metrics["samples"]
+                ) / max(1, total_samples)
+            else:
+                candidate["full_val_acc"] = candidate[
+                    "selection_val_acc"
+                ]
             candidate["model"].cpu()
             final_results.append(candidate)
             print(
-                "    {} + {} | full val={:.2f}% bal={:.2f}%".format(
+                "    {} + {} | select={:.2f}% confirm={} bal={:.2f}%".format(
                     self._spec_label(candidate["spec"]),
                     candidate["recipe"]["name"],
-                    candidate["val_acc"] * 100,
+                    candidate["selection_val_acc"] * 100,
+                    (
+                        "{:.2f}%".format(
+                            candidate["confirmation_val_acc"] * 100
+                        )
+                        if "confirmation_val_acc" in candidate
+                        else "n/a"
+                    ),
                     candidate["balanced_acc"] * 100,
                 )
             )
@@ -1652,7 +2653,74 @@ class NAS:
             key=lambda item: item.get("selection_score", -float("inf")),
             reverse=True,
         )
+        if (
+            len(final_results) >= 2
+            and "confirmation_val_acc" in final_results[0]
+            and "confirmation_val_acc" in final_results[1]
+        ):
+            first, second = final_results[:2]
+            samples = max(
+                1,
+                min(
+                    int(first.get("confirmation_samples", 1)),
+                    int(second.get("confirmation_samples", 1)),
+                ),
+            )
+            first_acc = float(first["confirmation_val_acc"])
+            second_acc = float(second["confirmation_val_acc"])
+            pooled_se = math.sqrt(
+                (
+                    first_acc * (1.0 - first_acc)
+                    + second_acc * (1.0 - second_acc)
+                )
+                / samples
+            )
+            tie_threshold = max(
+                1.0 / samples, min(0.01, 0.75 * pooled_se)
+            )
+            if abs(first_acc - second_acc) <= tie_threshold:
+                first["uncertainty_tie"] = True
+                second["uncertainty_tie"] = True
+                final_results[:2] = sorted(
+                    (first, second),
+                    key=lambda item: (
+                        -float(item.get("confirmation_val_loss", float("inf"))),
+                        item.get("selection_score", -float("inf")),
+                    ),
+                    reverse=True,
+                )
+                print(
+                    "  [NAS] Finalists overlap within {:.2f}pp; "
+                    "confirmation loss resolves the tie".format(
+                        tie_threshold * 100
+                    )
+                )
         winner = final_results[0]
+        challenger = final_results[1] if len(final_results) >= 2 else None
+        retained_challenger = None
+        if challenger is not None:
+            self.metadata["nas_challenger_spec"] = challenger["spec"]
+            self.metadata["nas_challenger_score"] = float(
+                challenger.get("selection_score", 0.0)
+            )
+            # Retain the actual checkpoint only for an uncertainty tie. A
+            # clearly weaker architecture is not worth its memory footprint.
+            if (
+                winner.get("uncertainty_tie", False)
+                and challenger.get("uncertainty_tie", False)
+            ):
+                retained_challenger = challenger
+                self._attach_recipe(
+                    retained_challenger["model"], self._default_recipe()
+                )
+                retained_challenger["model"].search_optimizer_state = (
+                    copy.deepcopy(
+                        retained_challenger.get("optimizer_state")
+                    )
+                )
+                self.metadata["nas_challenger_retained"] = True
+            else:
+                self.metadata["nas_challenger_retained"] = False
         print(
             "  [NAS] Robust architecture score selected {} ({:.4f})".format(
                 self._spec_label(winner["spec"]),
@@ -1660,7 +2728,11 @@ class NAS:
             )
         )
         for candidate in active:
-            if candidate is not winner and "model" in candidate:
+            if (
+                candidate is not winner
+                and candidate is not retained_challenger
+                and "model" in candidate
+            ):
                 del candidate["model"]
                 candidate.pop("optimizer_state", None)
         winner = self._recipe_tournament(
@@ -1669,7 +2741,22 @@ class NAS:
             refinement_loader,
             validation_batches,
             deadline_remaining,
+            confirmation_batches=confirmation_batches,
         )
+        if retained_challenger is not None:
+            # Keep the dormant module inside a plain bundle so nn.Module does
+            # not register/count/move it as a branch of the returned model.
+            # Trainer removes the bundle before training the primary model.
+            winner["model"].architecture_challenger_bundle = {
+                "model": retained_challenger["model"],
+                "spec": retained_challenger["spec"],
+                "val_acc": float(
+                    retained_challenger.get(
+                        "confirmation_val_acc",
+                        retained_challenger.get("val_acc", 0.0),
+                    )
+                ),
+            }
         return winner
 
     def _search_pipeline(
@@ -1711,6 +2798,15 @@ class NAS:
             )
         )
 
+        (
+            validation_batches,
+            confirmation_batches,
+        ) = self._cache_validation_splits()
+        validation_batches = validation_batches or None
+        confirmation_batches = confirmation_batches or None
+        self._select_augmentation_policy(
+            space, validation_batches, deadline_remaining
+        )
         inputs = self._fixed_calibration_inputs()
         ranked = self._proxy_screen(
             space, candidates, inputs, deadline_remaining
@@ -1735,7 +2831,23 @@ class NAS:
             )
 
         cached_batches = self._cache_search_batches()
-        validation_batches = self._cache_validation_batches() or None
+        self._calibrate_search_microbatch(
+            space, cached_batches, deadline_remaining
+        )
+        promoted_families = self._representation_probe_race(
+            space,
+            ranked,
+            cached_batches,
+            validation_batches,
+            deadline_remaining,
+        )
+        filtered_ranked = [
+            entry
+            for entry in ranked
+            if entry["spec"].model_family in promoted_families
+        ]
+        if filtered_ranked:
+            ranked = filtered_ranked
         if (
             not cached_batches
             or self.clock.check() <= deadline_remaining + 8
@@ -1756,6 +2868,7 @@ class NAS:
                 validation_batches,
                 round_plan,
                 deadline_remaining,
+                confirmation_batches=confirmation_batches,
             )
             if winner is None:
                 winner = ranked[0]
@@ -1795,6 +2908,17 @@ class NAS:
         self.metadata["nas_search_seconds"] = (
             start_remaining - self.clock.check()
         )
+        for metric in (
+            "val_loss",
+            "val_margin",
+            "examples_per_second",
+            "peak_memory_mb",
+            "train_validation_gap",
+        ):
+            if metric in winner:
+                self.metadata["nas_winner_{}".format(metric)] = winner[
+                    metric
+                ]
 
         summary = (
             "  [NAS] Winner: {} + {} | {:,} params | {} warm-start steps".format(

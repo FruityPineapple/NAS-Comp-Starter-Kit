@@ -87,6 +87,7 @@ def _run_recipe_race(
         deadline_remaining,
         recipe,
         optimizer_state=None,
+        start_step=0,
     ):
         name = recipe["name"]
         stage = stage_counts[name]
@@ -98,6 +99,7 @@ def _run_recipe_race(
                 "stage": stage + 1,
                 "start_marker": float(model.marker.item()),
                 "max_steps": int(max_steps),
+                "start_step": int(start_step),
                 "optimizer_marker": (
                     None
                     if optimizer_state is None
@@ -111,7 +113,15 @@ def _run_recipe_race(
             "state": {},
             "param_groups": [{"marker": float(marker)}],
         }
-        return int(max_steps), 0.1, False, state
+        accuracy = marker_metrics[float(marker)][0]
+        stats = {
+            "examples_seen": int(max_steps),
+            "train_accuracy": min(1.0, float(accuracy) + 0.05),
+            "train_loss": 1.0 - float(accuracy),
+            "final_lr": 1e-3,
+            "peak_memory_mb": 0.0,
+        }
+        return int(max_steps), 0.1, False, state, stats
 
     def fake_evaluate(self, model, source=None):
         evaluated_sources.append(source)
