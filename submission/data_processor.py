@@ -18,11 +18,10 @@ def _seed_worker(worker_id):
 
 class NASDataset(torch.utils.data.Dataset):
     def __init__(self, x, y=None, transform=None):
-        # Avoid a second full copy when the competition arrays are already
-        # contiguous float32.
+        # Preserve the source dtype. Converting an entire uint8/float64
+        # competition array to float32 can transiently double multi-gigabyte
+        # datasets; conversion is therefore performed per example below.
         self.x = torch.from_numpy(np.ascontiguousarray(x))
-        if self.x.dtype != torch.float32:
-            self.x = self.x.float()
         if self.x.ndim == 3:
             self.x = self.x.unsqueeze(1)
 
@@ -32,17 +31,27 @@ class NASDataset(torch.utils.data.Dataset):
             else None
         )
         self.transform = transform
+        self.augmentation_policies = {}
+        self.augmentation_policy = "default"
 
     def __len__(self):
         return len(self.x)
 
     def __getitem__(self, index):
         image = self.x[index]
+        if image.dtype != torch.float32:
+            image = image.to(dtype=torch.float32)
         if self.transform is not None:
             image = self.transform(image)
         if self.y is None:
             return image
         return image, self.y[index]
+
+    def set_augmentation_policy(self, name):
+        if name not in self.augmentation_policies:
+            raise KeyError("Unknown augmentation policy: {}".format(name))
+        self.augmentation_policy = str(name)
+        self.transform = self.augmentation_policies[name]
 
 
 def build_augmentation_pipeline(data_props, mean, std):
@@ -124,6 +133,36 @@ def build_augmentation_pipeline(data_props, mean, std):
     return transforms.Compose(augmentations), transforms.Compose([normalize])
 
 
+def build_augmentation_portfolio(data_props, mean, std):
+    """Return a small rule-safe policy portfolio with identity always present."""
+    selected, evaluation = build_augmentation_pipeline(data_props, mean, std)
+    policies = {"identity": evaluation}
+    if repr(selected) != repr(evaluation):
+        policies["conservative"] = selected
+
+    # When flips passed the label-aware invariance probe, expose a lighter
+    # alternative without crop/translation. The NAS controller can compare it
+    # against identity and the conservative default on a common checkpoint.
+    light = []
+    if data_props.get("horizontal_flip_safe", False):
+        light.append(transforms.RandomHorizontalFlip(p=0.5))
+    if (
+        data_props.get("vertical_flip_safe", False)
+        and data_props.get("is_square", False)
+    ):
+        light.append(transforms.RandomVerticalFlip(p=0.5))
+    if light:
+        light.append(transforms.Normalize(mean, std))
+        policies["safe_flips"] = transforms.Compose(light)
+
+    selected_name = (
+        "identity"
+        if data_props.get("distribution_shift_detected", False)
+        else ("conservative" if "conservative" in policies else "identity")
+    )
+    return policies, evaluation, selected_name
+
+
 class DataProcessor:
     def __init__(
         self,
@@ -172,6 +211,7 @@ class DataProcessor:
             )
         data_props["train_samples"] = int(len(self.train_x))
         data_props["valid_samples"] = int(len(self.valid_x))
+        data_props.update(self._estimate_distribution_shift())
         self._log_data_props(data_props)
         self.metadata["data_props"] = data_props
 
@@ -200,14 +240,27 @@ class DataProcessor:
             )
         )
 
-        train_transform, eval_transform = build_augmentation_pipeline(
+        (
+            augmentation_policies,
+            eval_transform,
+            selected_policy,
+        ) = build_augmentation_portfolio(
             data_props, mean, std
+        )
+        train_transform = augmentation_policies[selected_policy]
+        print(
+            "  [DataProcessor] Augmentation candidates: {}; default={}".format(
+                ",".join(augmentation_policies),
+                selected_policy,
+            )
         )
         print("  [DataProcessor] Train augmentations: {}".format(train_transform))
 
         train_dataset = NASDataset(
             self.train_x, self.train_y, transform=train_transform
         )
+        train_dataset.augmentation_policies = dict(augmentation_policies)
+        train_dataset.augmentation_policy = selected_policy
         valid_dataset = NASDataset(
             self.valid_x, self.valid_y, transform=eval_transform
         )
@@ -252,6 +305,10 @@ class DataProcessor:
         self.metadata["valid_num_batches"] = len(valid_loader)
         self.metadata["test_num_batches"] = len(test_loader)
         self.metadata["test_num_samples"] = len(test_dataset)
+        self.metadata["augmentation_candidates"] = list(
+            augmentation_policies
+        )
+        self.metadata["augmentation_policy"] = selected_policy
 
         print(
             "  [DataProcessor] Complete. Time remaining: ~{}".format(
@@ -260,20 +317,83 @@ class DataProcessor:
         )
         return train_loader, valid_loader, test_loader
 
-    def _compute_normalization_stats(self):
+    def _compute_normalization_stats(
+        self, max_samples=10000, max_chunk_megabytes=16
+    ):
+        """Compute channel moments with deterministic, byte-bounded chunks."""
         raw = self.train_x
-        if raw.shape[0] > 10000:
-            # Deterministic subsampling avoids a float32 copy of the entire
-            # training set.
-            indices = np.linspace(0, raw.shape[0] - 1, 10000, dtype=np.int64)
-            raw = raw[indices]
-        values = np.asarray(raw, dtype=np.float32)
-        if values.ndim == 3:
-            values = values[:, np.newaxis, :, :]
+        sample_count = min(int(raw.shape[0]), int(max_samples))
+        indices = np.linspace(
+            0, raw.shape[0] - 1, sample_count, dtype=np.int64
+        )
+        if raw.ndim == 3:
+            channels, height, width = 1, raw.shape[1], raw.shape[2]
+        else:
+            channels, height, width = raw.shape[1:]
+        bytes_per_sample = max(1, channels * height * width * 4)
+        chunk_samples = max(
+            1,
+            int(max_chunk_megabytes * 1024 * 1024) // bytes_per_sample,
+        )
+        channel_sum = np.zeros(channels, dtype=np.float64)
+        channel_square_sum = np.zeros(channels, dtype=np.float64)
+        elements_per_channel = 0
 
-        mean = np.mean(values, axis=(0, 2, 3))
-        std = np.maximum(np.std(values, axis=(0, 2, 3)), 1e-6)
+        for start in range(0, sample_count, chunk_samples):
+            chunk_indices = indices[start : start + chunk_samples]
+            values = np.asarray(raw[chunk_indices], dtype=np.float32)
+            if values.ndim == 3:
+                values = values[:, np.newaxis, :, :]
+            channel_sum += values.sum(axis=(0, 2, 3), dtype=np.float64)
+            channel_square_sum += np.square(
+                values, dtype=np.float32
+            ).sum(axis=(0, 2, 3), dtype=np.float64)
+            elements_per_channel += values.shape[0] * height * width
+
+        denominator = max(1, elements_per_channel)
+        mean = channel_sum / denominator
+        variance = np.maximum(
+            channel_square_sum / denominator - np.square(mean),
+            1e-12,
+        )
+        std = np.maximum(np.sqrt(variance), 1e-6)
+        self.metadata["normalization_samples"] = sample_count
+        self.metadata["normalization_chunk_samples"] = chunk_samples
         return mean.tolist(), std.tolist()
+
+    def _estimate_distribution_shift(self, max_samples=256):
+        """Compare train/validation channel moments without fitting a model."""
+        if len(self.valid_x) == 0 or len(self.train_x) == 0:
+            return {
+                "distribution_shift_score": 0.0,
+                "distribution_shift_detected": False,
+            }
+
+        def moments(values):
+            count = min(len(values), int(max_samples))
+            indices = np.linspace(
+                0, len(values) - 1, count, dtype=np.int64
+            )
+            sample = np.asarray(values[indices], dtype=np.float32)
+            if sample.ndim == 3:
+                sample = sample[:, np.newaxis, :, :]
+            return (
+                sample.mean(axis=(0, 2, 3), dtype=np.float64),
+                sample.std(axis=(0, 2, 3), dtype=np.float64),
+            )
+
+        train_mean, train_std = moments(self.train_x)
+        valid_mean, valid_std = moments(self.valid_x)
+        scale = np.maximum(0.5 * (train_std + valid_std), 1e-4)
+        mean_shift = float(np.mean(np.abs(train_mean - valid_mean) / scale))
+        std_shift = float(
+            np.mean(np.abs(train_std - valid_std) / np.maximum(scale, 1e-4))
+        )
+        score = mean_shift + 0.5 * std_shift
+        return {
+            "distribution_shift_score": score,
+            "distribution_shift_detected": bool(score >= 0.75),
+        }
 
     def _estimate_flip_safety(self, data_props):
         """
@@ -414,6 +534,14 @@ class DataProcessor:
         print(
             "    - Class imbalance ratio: {:.2f}".format(
                 props["class_imbalance_ratio"]
+            )
+        )
+        print(
+            "    - Train/validation shift: {:.3f}{}".format(
+                props.get("distribution_shift_score", 0.0),
+                " (detected)"
+                if props.get("distribution_shift_detected", False)
+                else "",
             )
         )
         print("    - Num classes: {}".format(self.metadata["num_classes"]))

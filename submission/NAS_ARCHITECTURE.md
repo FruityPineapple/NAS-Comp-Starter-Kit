@@ -19,8 +19,20 @@ weiter unten:
   erhalten koennen.
 - Die Architekturentscheidung kombiniert Full Validation, die vorherige
   Fidelity und Rangstabilitaet ueber die Lernkurve.
-- Erst danach vergleicht ein separates Recipe-Turnier Recipes auf Klonen
-  desselben Architektur-Checkpoints.
+- Erst danach vergleicht ein separates, zweistufiges Recipe-Rennen Recipes auf
+  Klonen desselben Architektur-Checkpoints. Der unveraenderte Checkpoint ist
+  ein expliziter Incumbent und wird auf exakt derselben Validation-Quelle
+  bewertet.
+- Alle Recipes starten mit identischen Gewichten, Datenreihenfolgen und Seeds.
+  Wenn es die Clock erlaubt, erhalten die zwei besten Recipes eine zweite
+  gleich grosse Stufe. Validation-Accuracy bleibt das Hauptsignal; eine
+  begrenzte Validation-Loss-Steigung entscheidet knappe, noch lernende
+  Kandidaten.
+- Pro Recipe bleibt das beste bewertete Stufen-Checkpoint samt zugehoerigem
+  Optimizer-State erhalten. Ein Recipe ersetzt den Incumbent nur ab mindestens
+  0,10 Prozentpunkten beziehungsweise einem zusaetzlich korrekt klassifizierten
+  Validation-Beispiel. Andernfalls bleiben Incumbent-Gewichte und deren
+  Optimizer-State unveraendert.
 - Axis-Encoder besitzen eine parameterfreie absolute Positionskodierung und
   mehrere geordnete Pooling-Bins statt eines einzigen globalen Mittelwerts.
 - Der finale Trainer verwendet bei einem ausgeschoepften Versuch keinen
@@ -205,7 +217,8 @@ eigenständige `nn.Module`-Objekte. Parameterzahlen werden analytisch berechnet.
 
 Hinweis: Die unten noch beschriebene gemeinsame Auswahl ist historisch. Aktiv
 ist die oben dokumentierte Trennung aus neutralem Architekturvergleich und
-anschliessendem Recipe-Turnier auf identischen Checkpoint-Klonen.
+anschliessendem, Incumbent-sicherem Recipe-Rennen auf identischen
+Checkpoint-Klonen.
 
 Architecture Search und Trainingspolicy werden in einem kleinen,
 kontrollierten Produktraum gemeinsam gewählt:
@@ -317,6 +330,34 @@ Durchläufe erlaubt; die Wall-Clock-Grenze bleibt vorrangig. Dadurch erhöht die
 Finalrunde Datenabdeckung und Warm-Start-Qualität, ohne das geschützte finale
 Trainingsbudget anzutasten.
 
+### 8.5 Incumbent-sicheres Recipe-Rennen
+
+Nach der Architekturwahl wird ihr gemeinsames Checkpoint auf genau der
+Validation-Quelle bewertet, die auch fuer alle Recipe-Trials gilt. Diese
+Messung liefert Accuracy, Balanced Accuracy und eine recipe-neutrale
+Cross-Entropy-Loss.
+
+Das Rennen besitzt zwei Stufen:
+
+1. Jedes aktive Recipe startet vom byte-identischen Architektur-Checkpoint
+   ohne uebernommenen Optimizer-State und erhaelt dieselbe Schrittzahl,
+   Datenreihenfolge und denselben Seed.
+2. Die zwei besten Trials werden anhand ihrer bisher besten Accuracy plus
+   einer kleinen, begrenzten Validation-Loss-Steigung promoviert. Beide
+   erhalten wieder dieselbe Schrittzahl und denselben Stufen-Seed.
+
+Jeder Trial schuetzt sein bestes an einer Stufengrenze bewertetes Modell. Sinkt
+die Accuracy in Stufe zwei, werden Gewichte und Optimizer-State aus der
+besseren Stufe wiederhergestellt. Ein Recipe darf den Incumbent nur ersetzen,
+wenn seine beste Accuracy den Incumbent um mindestens `max(0.001, 1/N_valid)`
+uebertrifft. Kann nicht jedes Recipe Stufe eins oder koennen nicht zwei Recipes
+Stufe zwei fair abschliessen, bleibt der Incumbent erhalten.
+
+Der an den finalen Trainer uebergebene AdamW-State gehoert dadurch immer exakt
+zum zurueckgegebenen Checkpoint. Bei Incumbent-Fallback wird dessen
+Architektur-Optimizer-State beibehalten. Die unabhaengigen Trainer-Retries
+starten weiterhin vom gemeinsamen NAS-Checkpoint.
+
 ## 9. Finaler Trainer
 
 ### 9.1 Durchsatz und Zeitreserve
@@ -380,10 +421,13 @@ nicht vollständig fehlschlagen.
 6. Jede aktive Familie erhält nach Möglichkeit labelbasierte Evidenz.
 7. Full Validation entscheidet nur gegen Full Validation.
 8. Das beste Checkpoint wird vor Prediction wiederhergestellt.
-9. LR steigt innerhalb eines Optimierungsversuchs nicht wieder an; erlaubt ist
+9. Kein Recipe-Trial darf ein staerkeres gemeinsames Architektur-Checkpoint
+   ersetzen; Modell- und Optimizer-State werden als zusammengehoeriges Paar
+   uebergeben.
+10. LR steigt innerhalb eines Optimierungsversuchs nicht wieder an; erlaubt ist
    ausschließlich der einmalige protokollierte Fine-Tuning-Neustart vom besten
    Checkpoint.
-10. Fehlende Proxywerte oder einzelne OOM-Kandidaten stoppen nicht die
+11. Fehlende Proxywerte oder einzelne OOM-Kandidaten stoppen nicht die
     gesamte Pipeline.
 
 ## 11. Validierung
@@ -396,12 +440,19 @@ Lokal geprüft:
 - Portfolio-Größe auf natürlichen und strukturierten Inputs,
 - exakte analytische Parameterzahl für 36 Kombinationen über alle sechs
   Modellfamilien,
+- Incumbent-Erhalt gegen schwächere Recipe-Trials,
+- identische Recipe-Startgewichte, Seeds und Stufen-Schrittzahlen,
+- zweistufige Promotion mit Validation-Loss-Steigung,
+- Wiederherstellung des besten Recipe-Stufen-Checkpoints samt passendem
+  Optimizer-State,
+- sicherer Incumbent-Fallback bei kurzem Budget,
 - unveränderte Competition-API,
 - Archivstruktur ohne Evaluator oder Testdateien.
 
 Ein vollständiger Accuracy- und CUDA-Lauf bleibt in Colab beziehungsweise der
-Competition-Umgebung erforderlich, da die lokale Python-Installation kein
-PyTorch enthält.
+Competition-Umgebung erforderlich. Die Miniconda-Installation enthält CPU-
+PyTorch für lokale Regressionstests, aber die Competition-CUDA-Umgebung wurde
+hier nicht ausgeführt.
 
 ## 12. Offene empirische Kalibrierung
 
@@ -421,6 +472,21 @@ verwendeten Dataset bewertet. Optimiert werden Median, Worst Case und
 Fehlerrate, nicht der Codename eines einzelnen Tests.
 
 ## 13. Änderungsprotokoll
+
+### 30. Juli 2026 - Incumbent-sicheres zweistufiges Recipe-Rennen
+
+- Architektur-Checkpoint als expliziten Incumbent auf derselben
+  Validation-Quelle wie alle Recipes eingeführt.
+- Recipe-neutrale Validation-Cross-Entropy und begrenzte Loss-Steigung als
+  Nahbereichssignal ergänzt.
+- Faire erste Stufe für alle Recipes und zweite Stufe für zwei Promovierte
+  eingeführt.
+- Bestes bewertetes Stufen-Checkpoint sowie passendes AdamW-State pro Trial
+  geschützt.
+- Mindestverbesserung von 0,10 Prozentpunkten beziehungsweise einem
+  Validation-Beispiel vor Incumbent-Ersatz eingeführt.
+- Kurze oder unvollständige Rennen fallen ohne Gewichtsregression auf den
+  Incumbent zurück.
 
 ### 30. Juli 2026 - Controller-Nachschärfung nach Teilrun
 

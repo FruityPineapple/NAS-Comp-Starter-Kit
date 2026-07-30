@@ -36,7 +36,16 @@ most 12 percent or 120 seconds. Training and prediction time remain protected.
 - The last two candidates receive equal full-data passes while either learning
   curve still improves. AdamW state persists across fidelity rounds.
 - Full validation, preceding fidelity, and rank stability select the
-  architecture. Recipes are then compared on clones of the same checkpoint.
+  architecture.
+- Recipes then enter an incumbent-safe two-stage race. Every recipe starts
+  from byte-identical architecture weights with the same data order and seed;
+  the best two receive a second equal segment when affordable.
+- Validation accuracy plus a bounded validation-loss slope ranks recipe
+  trials. Each trial retains its best evaluated stage and matching optimizer
+  state.
+- A recipe replaces the architecture checkpoint only after improving by at
+  least 0.10 percentage points or one validation example. Short or incomplete
+  races preserve the incumbent.
 - Axis encoders use absolute sinusoidal position features and coarse ordered
   pooling bins instead of destroying all order with a global mean.
 - The trainer uses validation-driven LR reductions plus a monotonic

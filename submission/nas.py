@@ -1,5 +1,6 @@
 """Hierarchical, portfolio-based NAS for unseen classification datasets."""
 
+import copy
 import math
 import random
 import time
@@ -7,6 +8,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from helpers import get_device, get_tier, show_time
 from search_space import ArchSpec, SearchSpace
@@ -781,6 +783,7 @@ class NAS:
         model.eval()
         correct = 0
         total = 0
+        total_loss = 0.0
         class_correct = torch.zeros(self.num_classes, dtype=torch.long)
         class_total = torch.zeros(self.num_classes, dtype=torch.long)
         with torch.no_grad():
@@ -795,6 +798,11 @@ class NAS:
                     enabled=self.device.type == "cuda"
                 ):
                     output = model(data)
+                total_loss += float(
+                    F.cross_entropy(
+                        output.float(), target, reduction="sum"
+                    ).item()
+                )
                 predictions = output.argmax(dim=1)
                 matches = predictions == target
                 correct += int(matches.sum().item())
@@ -823,6 +831,7 @@ class NAS:
         return {
             "accuracy": correct / max(1, total),
             "balanced_accuracy": balanced,
+            "loss": total_loss / max(1, total),
             "samples": total,
         }
 
@@ -915,6 +924,41 @@ class NAS:
             )
         return entries
 
+    @staticmethod
+    def _recipe_trial_score(trial):
+        """Favor validation accuracy while using loss slope near a tie."""
+        history = trial.get("metrics_history", [])
+        if len(history) >= 2:
+            first_loss = float(history[0].get("loss", 0.0))
+            latest_loss = float(history[-1].get("loss", first_loss))
+            scale = max(1e-8, abs(first_loss))
+            loss_slope = (
+                (first_loss - latest_loss)
+                / scale
+                / max(1, len(history) - 1)
+            )
+        else:
+            loss_slope = 0.0
+        # Loss is deliberately a bounded near-tie signal. Competition score
+        # remains accuracy-based, but a still-improving recipe should survive
+        # a tiny early accuracy deficit.
+        bounded_slope = max(-0.25, min(0.25, loss_slope))
+        score = float(trial.get("best_val_acc", 0.0)) + 0.01 * bounded_slope
+        trial["loss_slope"] = loss_slope
+        trial["selection_score"] = score
+        return score
+
+    def _recipe_acceptance_margin(self, samples):
+        """Require at least one validation example and a 0.10pp floor."""
+        configured_floor = float(
+            getattr(self, "recipe_min_accuracy_gain", 0.001)
+        )
+        return max(
+            0.0,
+            configured_floor,
+            1.0 / max(1, int(samples)),
+        )
+
     def _recipe_tournament(
         self,
         space,
@@ -923,12 +967,66 @@ class NAS:
         validation_batches,
         deadline_remaining,
     ):
-        """Compare recipes on clones of one architecture checkpoint."""
+        """Run an incumbent-safe, two-stage race from one checkpoint."""
         recipes = self._training_recipes()
+        architecture_model = architecture_winner["model"]
         common_state = {
             key: value.detach().cpu().clone()
-            for key, value in architecture_winner["model"].state_dict().items()
+            for key, value in architecture_model.state_dict().items()
         }
+        common_optimizer_state = copy.deepcopy(
+            architecture_winner.pop("optimizer_state", None)
+        )
+
+        # The incumbent and every recipe endpoint are measured on this exact
+        # source. A cached validation source is never compared with a full-
+        # validation number left over from architecture selection.
+        architecture_model.to(self.device)
+        incumbent_metrics = self._evaluate(
+            architecture_model, validation_batches
+        )
+        architecture_model.cpu()
+        incumbent_accuracy = float(incumbent_metrics["accuracy"])
+        incumbent_loss = float(
+            incumbent_metrics.get("loss", 1.0 - incumbent_accuracy)
+        )
+        incumbent_samples = int(incumbent_metrics.get("samples", 0))
+        acceptance_margin = self._recipe_acceptance_margin(
+            incumbent_samples
+        )
+        default_recipe = self._default_recipe()
+
+        def restore_incumbent(reason):
+            architecture_model.load_state_dict(common_state)
+            self._attach_recipe(architecture_model, default_recipe)
+            architecture_model.independent_retry_state = {
+                key: value.detach().cpu().clone()
+                for key, value in common_state.items()
+            }
+            architecture_model.search_optimizer_state = copy.deepcopy(
+                common_optimizer_state
+            )
+            architecture_model.alternative_training_recipes = [
+                dict(recipe)
+                for recipe in recipes
+                if recipe["name"] != default_recipe["name"]
+            ]
+            architecture_winner["model"] = architecture_model
+            architecture_winner["recipe"] = dict(default_recipe)
+            architecture_winner["val_acc"] = incumbent_accuracy
+            architecture_winner["balanced_acc"] = float(
+                incumbent_metrics.get(
+                    "balanced_accuracy", incumbent_accuracy
+                )
+            )
+            architecture_winner.pop("optimizer_state", None)
+            print(
+                "  [NAS] Recipe race preserved incumbent ({:.2f}%): {}".format(
+                    incumbent_accuracy * 100, reason
+                )
+            )
+            return architecture_winner
+
         available = max(
             0.0, self.clock.check() - deadline_remaining - 6.0
         )
@@ -936,49 +1034,38 @@ class NAS:
             1e-4, architecture_winner.get("seconds_per_step", 0.05)
         )
         if refinement_loader is None:
-            common_steps = 0
+            stage_one_steps = 0
         else:
-            common_steps = min(
+            promoted_count = min(2, len(recipes))
+            safe_seconds_per_step = 1.80 * seconds_per_step
+            total_step_capacity = int(
+                0.70 * available / max(1e-4, safe_seconds_per_step)
+            )
+            stage_one_steps = min(
                 len(refinement_loader),
-                int(0.70 * available / max(1e-4, len(recipes) * seconds_per_step)),
+                total_step_capacity
+                // max(1, len(recipes) + promoted_count),
             )
 
-        if common_steps < 12:
-            selected_recipe = self._default_recipe()
-            architecture_winner["model"].load_state_dict(common_state)
-            self._attach_recipe(
-                architecture_winner["model"], selected_recipe
-            )
-            architecture_winner["recipe"] = dict(selected_recipe)
-            architecture_winner["model"].independent_retry_state = common_state
-            architecture_winner["model"].search_optimizer_state = (
-                architecture_winner.pop("optimizer_state", None)
-            )
-            architecture_winner[
-                "model"
-            ].alternative_training_recipes = [
-                dict(recipe)
-                for recipe in recipes
-                if recipe["name"] != selected_recipe["name"]
-            ]
-            print(
-                "  [NAS] Recipe tournament skipped safely; using {} "
-                "(only {} equal steps affordable)".format(
-                    selected_recipe["name"], common_steps
+        if stage_one_steps < 12 or len(recipes) < 2:
+            return restore_incumbent(
+                "only {} equal first-stage steps affordable".format(
+                    stage_one_steps
                 )
             )
-            return architecture_winner
 
         print(
-            "  [NAS] Decoupled recipe tournament on {}: {} recipes, "
-            "{} equal steps".format(
+            "  [NAS] Incumbent-safe recipe race on {}: incumbent={:.2f}% "
+            "(loss {:.4f}), {} recipes, {} equal stage-1 steps".format(
                 self._spec_label(architecture_winner["spec"]),
+                incumbent_accuracy * 100,
+                incumbent_loss,
                 len(recipes),
-                common_steps,
+                stage_one_steps,
             )
         )
         trials = []
-        for recipe_index, recipe in enumerate(recipes):
+        for recipe in recipes:
             if self.clock.check() <= deadline_remaining + 4:
                 break
             self._seed_everything(self.seed + 12000)
@@ -994,101 +1081,261 @@ class NAS:
             ) = self._train_low_fidelity(
                 model,
                 refinement_loader,
-                common_steps,
-                max(5.0, 1.80 * seconds_per_step * common_steps),
+                stage_one_steps,
+                max(5.0, 1.80 * seconds_per_step * stage_one_steps),
                 deadline_remaining,
                 recipe,
                 None,
             )
-            if failed or steps < common_steps:
+            if failed or steps < stage_one_steps:
                 model.cpu()
                 del model
                 continue
             metrics = self._evaluate(model, validation_batches)
             model.cpu()
-            trials.append(
-                {
-                    "model": model,
-                    "recipe": dict(recipe),
-                    "val_acc": metrics["accuracy"],
-                    "steps": steps,
-                    "elapsed": elapsed,
-                    "optimizer_state": optimizer_state,
-                }
+            trial_accuracy = float(metrics["accuracy"])
+            trial_loss = float(
+                metrics.get("loss", 1.0 - trial_accuracy)
             )
+            trial = {
+                "model": model,
+                "recipe": dict(recipe),
+                "metrics_history": [
+                    {
+                        "accuracy": incumbent_accuracy,
+                        "loss": incumbent_loss,
+                    },
+                    {
+                        "accuracy": trial_accuracy,
+                        "loss": trial_loss,
+                    },
+                ],
+                "best_val_acc": trial_accuracy,
+                "best_val_loss": trial_loss,
+                "best_balanced_acc": float(
+                    metrics.get("balanced_accuracy", trial_accuracy)
+                ),
+                "best_steps": steps,
+                "best_elapsed": elapsed,
+                "best_optimizer_state": copy.deepcopy(optimizer_state),
+            }
+            self._recipe_trial_score(trial)
+            trials.append(trial)
             print(
-                "    recipe {} | val={:.2f}% | steps={}".format(
-                    recipe["name"], metrics["accuracy"] * 100, steps
+                "    stage 1 {} | val={:.2f}% loss={:.4f} "
+                "slope={:+.4f} steps={}".format(
+                    recipe["name"],
+                    trial_accuracy * 100,
+                    trial_loss,
+                    trial["loss_slope"],
+                    steps,
                 )
             )
 
-        if len(trials) < 2:
-            selected_recipe = self._default_recipe()
-            selected_trial = next(
-                (
-                    trial
-                    for trial in trials
-                    if trial["recipe"]["name"]
-                    == selected_recipe["name"]
-                ),
-                None,
-            )
+        if len(trials) < len(recipes):
             for trial in trials:
-                if trial is not selected_trial:
-                    del trial["model"]
-            if selected_trial is None:
-                architecture_winner["model"].load_state_dict(common_state)
-                self._attach_recipe(
-                    architecture_winner["model"], selected_recipe
+                del trial["model"]
+            return restore_incumbent(
+                "not every recipe completed the fair first stage"
+            )
+
+        trials.sort(
+            key=lambda item: (
+                item["selection_score"],
+                item["best_val_acc"],
+                -item["best_val_loss"],
+            ),
+            reverse=True,
+        )
+        promoted = trials[:2]
+        for trial in trials[2:]:
+            del trial["model"]
+
+        stage_two_available = max(
+            0.0, self.clock.check() - deadline_remaining - 6.0
+        )
+        stage_two_steps = min(
+            len(refinement_loader),
+            int(
+                0.70
+                * stage_two_available
+                / max(
+                    1e-4,
+                    len(promoted) * 1.80 * seconds_per_step,
                 )
-                search_state = architecture_winner.pop(
-                    "optimizer_state", None
+            ),
+        )
+        if stage_two_steps < 12:
+            for trial in promoted:
+                del trial["model"]
+            return restore_incumbent(
+                "only {} equal second-stage steps affordable".format(
+                    stage_two_steps
+                )
+            )
+
+        print(
+            "  [NAS] Recipe race stage 2: promoting {} for {} equal steps".format(
+                ",".join(
+                    trial["recipe"]["name"] for trial in promoted
+                ),
+                stage_two_steps,
+            )
+        )
+        completed_stage_two = 0
+        for trial in promoted:
+            if self.clock.check() <= deadline_remaining + 4:
+                break
+            model = trial["model"]
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            previous_optimizer_state = copy.deepcopy(
+                trial["best_optimizer_state"]
+            )
+            previous_best_steps = int(trial["best_steps"])
+            previous_best_elapsed = float(trial["best_elapsed"])
+            self._seed_everything(self.seed + 13000)
+            (
+                steps,
+                elapsed,
+                failed,
+                optimizer_state,
+            ) = self._train_low_fidelity(
+                model,
+                refinement_loader,
+                stage_two_steps,
+                max(5.0, 1.80 * seconds_per_step * stage_two_steps),
+                deadline_remaining,
+                trial["recipe"],
+                previous_optimizer_state,
+            )
+            if failed or steps < stage_two_steps:
+                model.load_state_dict(best_state)
+                model.cpu()
+                continue
+
+            metrics = self._evaluate(model, validation_batches)
+            current_accuracy = float(metrics["accuracy"])
+            current_loss = float(
+                metrics.get("loss", 1.0 - current_accuracy)
+            )
+            trial["metrics_history"].append(
+                {
+                    "accuracy": current_accuracy,
+                    "loss": current_loss,
+                }
+            )
+            is_better_checkpoint = (
+                current_accuracy > trial["best_val_acc"] + 1e-12
+                or (
+                    abs(current_accuracy - trial["best_val_acc"]) <= 1e-12
+                    and current_loss < trial["best_val_loss"]
+                )
+            )
+            if is_better_checkpoint:
+                trial["best_val_acc"] = current_accuracy
+                trial["best_val_loss"] = current_loss
+                trial["best_balanced_acc"] = float(
+                    metrics.get("balanced_accuracy", current_accuracy)
+                )
+                trial["best_steps"] = previous_best_steps + steps
+                trial["best_elapsed"] = previous_best_elapsed + elapsed
+                trial["best_optimizer_state"] = copy.deepcopy(
+                    optimizer_state
                 )
             else:
-                del architecture_winner["model"]
-                architecture_winner["model"] = selected_trial["model"]
-                architecture_winner["recipe"] = selected_trial["recipe"]
-                architecture_winner["val_acc"] = selected_trial["val_acc"]
-                architecture_winner["trained_steps"] += selected_trial[
-                    "steps"
-                ]
-                architecture_winner["train_seconds"] += selected_trial[
-                    "elapsed"
-                ]
-                search_state = selected_trial["optimizer_state"]
-            architecture_winner["recipe"] = dict(selected_recipe)
-            architecture_winner["model"].independent_retry_state = common_state
-            architecture_winner[
-                "model"
-            ].search_optimizer_state = search_state
-            architecture_winner[
-                "model"
-            ].alternative_training_recipes = [
-                dict(recipe)
-                for recipe in recipes
-                if recipe["name"] != selected_recipe["name"]
-                ]
-            architecture_winner.pop("optimizer_state", None)
-            return architecture_winner
-        trials.sort(key=lambda item: item["val_acc"], reverse=True)
-        selected = trials[0]
-        for trial in trials[1:]:
-            del trial["model"]
-        del architecture_winner["model"]
-        architecture_winner["model"] = selected["model"]
-        architecture_winner["model"].search_optimizer_state = selected[
-            "optimizer_state"
+                model.load_state_dict(best_state)
+                trial["best_steps"] = previous_best_steps
+                trial["best_elapsed"] = previous_best_elapsed
+                trial["best_optimizer_state"] = previous_optimizer_state
+            model.cpu()
+            self._recipe_trial_score(trial)
+            completed_stage_two += 1
+            print(
+                "    stage 2 {} | val={:.2f}% loss={:.4f} "
+                "best={:.2f}% slope={:+.4f}".format(
+                    trial["recipe"]["name"],
+                    current_accuracy * 100,
+                    current_loss,
+                    trial["best_val_acc"] * 100,
+                    trial["loss_slope"],
+                )
+            )
+
+        if completed_stage_two < 2:
+            for trial in promoted:
+                del trial["model"]
+            return restore_incumbent(
+                "fewer than two recipes completed the fair second stage"
+            )
+
+        promoted.sort(
+            key=lambda item: (
+                item["selection_score"],
+                item["best_val_acc"],
+                -item["best_val_loss"],
+            ),
+            reverse=True,
+        )
+        eligible = [
+            trial
+            for trial in promoted
+            if (
+                trial["best_val_acc"] - incumbent_accuracy + 1e-12
+                >= acceptance_margin
+            )
         ]
-        architecture_winner["recipe"] = selected["recipe"]
-        architecture_winner["val_acc"] = selected["val_acc"]
-        architecture_winner["trained_steps"] += selected["steps"]
-        architecture_winner["train_seconds"] += selected["elapsed"]
-        architecture_winner["model"].independent_retry_state = common_state
-        architecture_winner["model"].alternative_training_recipes = [
-            trial["recipe"]
-            for trial in trials[1:]
+        if not eligible:
+            for trial in promoted:
+                del trial["model"]
+            return restore_incumbent(
+                "no recipe beat it by the {:.2f}pp margin".format(
+                    acceptance_margin * 100
+                )
+            )
+
+        selected = eligible[0]
+        for trial in promoted:
+            if trial is not selected:
+                del trial["model"]
+        selected_model = selected["model"]
+        self._attach_recipe(selected_model, selected["recipe"])
+        selected_model.search_optimizer_state = copy.deepcopy(
+            selected["best_optimizer_state"]
+        )
+        selected_model.independent_retry_state = {
+            key: value.detach().cpu().clone()
+            for key, value in common_state.items()
+        }
+        selected_model.alternative_training_recipes = [
+            dict(recipe)
+            for recipe in recipes
+            if recipe["name"] != selected["recipe"]["name"]
         ]
+        architecture_winner["model"] = selected_model
+        architecture_winner["recipe"] = dict(selected["recipe"])
+        architecture_winner["val_acc"] = selected["best_val_acc"]
+        architecture_winner["balanced_acc"] = selected[
+            "best_balanced_acc"
+        ]
+        architecture_winner["trained_steps"] = int(
+            architecture_winner.get("trained_steps", 0)
+        ) + int(selected["best_steps"])
+        architecture_winner["train_seconds"] = float(
+            architecture_winner.get("train_seconds", 0.0)
+        ) + float(selected["best_elapsed"])
         architecture_winner.pop("optimizer_state", None)
+        print(
+            "  [NAS] Recipe race selected {} at {:.2f}% "
+            "(incumbent {:.2f}%, margin {:.2f}pp)".format(
+                selected["recipe"]["name"],
+                selected["best_val_acc"] * 100,
+                incumbent_accuracy * 100,
+                acceptance_margin * 100,
+            )
+        )
         return architecture_winner
 
     def _successive_halving(

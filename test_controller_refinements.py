@@ -3,8 +3,9 @@
 import os
 import random
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
+import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "submission"))
 
@@ -17,6 +18,150 @@ RECIPES = [
     {"name": "regularized"},
     {"name": "fast_fit"},
 ]
+
+
+class _ConstantClock:
+    def __init__(self, remaining):
+        self.remaining = float(remaining)
+
+    def check(self):
+        return self.remaining
+
+
+class _TinyRecipeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.marker = torch.nn.Parameter(torch.tensor([0.0]))
+
+    def forward(self, data):
+        return torch.zeros((data.size(0), 2), device=data.device)
+
+
+class _TinyRecipeSpace:
+    def __init__(self):
+        self.models = []
+
+    def build_model(self, spec):
+        model = _TinyRecipeModel()
+        self.models.append(model)
+        return model
+
+
+def _run_recipe_race(
+    schedule,
+    incumbent_accuracy=0.84,
+    incumbent_loss=0.70,
+    samples=1000,
+    remaining=1000.0,
+    seconds_per_step=0.001,
+    loader_steps=20,
+):
+    controller = object.__new__(NAS)
+    controller.clock = _ConstantClock(remaining)
+    controller.seed = 17
+    controller.device = torch.device("cpu")
+    controller.recipe_min_accuracy_gain = 0.001
+    recipes = [dict(recipe) for recipe in RECIPES]
+    controller._training_recipes = MethodType(
+        lambda self: recipes, controller
+    )
+    controller._default_recipe = MethodType(
+        lambda self: recipes[0], controller
+    )
+
+    stage_counts = {recipe["name"]: 0 for recipe in recipes}
+    train_calls = []
+    seed_calls = []
+    evaluated_sources = []
+    marker_metrics = {}
+    for stages in schedule.values():
+        for marker, accuracy, loss in stages:
+            marker_metrics[float(marker)] = (float(accuracy), float(loss))
+
+    def fake_train(
+        self,
+        model,
+        batch_source,
+        max_steps,
+        time_quantum,
+        deadline_remaining,
+        recipe,
+        optimizer_state=None,
+    ):
+        name = recipe["name"]
+        stage = stage_counts[name]
+        stage_counts[name] += 1
+        marker, _, _ = schedule[name][stage]
+        train_calls.append(
+            {
+                "name": name,
+                "stage": stage + 1,
+                "start_marker": float(model.marker.item()),
+                "max_steps": int(max_steps),
+                "optimizer_marker": (
+                    None
+                    if optimizer_state is None
+                    else optimizer_state["param_groups"][0]["marker"]
+                ),
+            }
+        )
+        with torch.no_grad():
+            model.marker.fill_(float(marker))
+        state = {
+            "state": {},
+            "param_groups": [{"marker": float(marker)}],
+        }
+        return int(max_steps), 0.1, False, state
+
+    def fake_evaluate(self, model, source=None):
+        evaluated_sources.append(source)
+        marker = float(model.marker.item())
+        if abs(marker - 1.0) < 1e-6:
+            accuracy, loss = incumbent_accuracy, incumbent_loss
+        else:
+            accuracy, loss = marker_metrics[marker]
+        return {
+            "accuracy": float(accuracy),
+            "balanced_accuracy": float(accuracy),
+            "loss": float(loss),
+            "samples": int(samples),
+        }
+
+    controller._train_low_fidelity = MethodType(fake_train, controller)
+    controller._evaluate = MethodType(fake_evaluate, controller)
+    controller._seed_everything = seed_calls.append
+
+    architecture_model = _TinyRecipeModel()
+    with torch.no_grad():
+        architecture_model.marker.fill_(1.0)
+    spec = ArchSpec(2, 16, 1, "basic", 3, False, 3, "spatial")
+    winner = {
+        "model": architecture_model,
+        "spec": spec,
+        "params": 1,
+        "val_acc": incumbent_accuracy,
+        "seconds_per_step": seconds_per_step,
+        "trained_steps": 10,
+        "train_seconds": 1.0,
+        "optimizer_state": {
+            "state": {},
+            "param_groups": [{"marker": 1.0}],
+        },
+    }
+    space = _TinyRecipeSpace()
+    validation_source = [None]
+    result = controller._recipe_tournament(
+        space,
+        winner,
+        [None] * loader_steps,
+        validation_source,
+        0.0,
+    )
+    return result, train_calls, space, {
+        "seed_calls": seed_calls,
+        "evaluated_sources": evaluated_sources,
+        "validation_source": validation_source,
+    }
 
 
 def _ranked_entries(families, per_family=6):
@@ -153,9 +298,125 @@ def test_search_plateau_keeps_state_and_reduces_lr():
     ) < 1e-12
 
 
+def test_recipe_race_preserves_a_stronger_incumbent():
+    result, calls, _, observations = _run_recipe_race(
+        {
+            "stable": [(2, 0.80, 0.75), (5, 0.805, 0.72)],
+            "regularized": [(3, 0.79, 0.78), (6, 0.795, 0.74)],
+            "fast_fit": [(4, 0.78, 0.80)],
+        }
+    )
+    assert abs(result["val_acc"] - 0.84) < 1e-12
+    assert abs(result["model"].marker.item() - 1.0) < 1e-12
+    assert (
+        result["model"].search_optimizer_state["param_groups"][0]["marker"]
+        == 1.0
+    )
+    stage_one = [call for call in calls if call["stage"] == 1]
+    stage_two = [call for call in calls if call["stage"] == 2]
+    assert [call["start_marker"] for call in stage_one] == [1.0, 1.0, 1.0]
+    assert len(stage_two) == 2
+    assert len({call["max_steps"] for call in stage_one}) == 1
+    assert len({call["max_steps"] for call in stage_two}) == 1
+    assert observations["seed_calls"] == [
+        12017,
+        12017,
+        12017,
+        13017,
+        13017,
+    ]
+    assert all(
+        source is observations["validation_source"]
+        for source in observations["evaluated_sources"]
+    )
+
+
+def test_recipe_race_restores_best_stage_and_matching_optimizer():
+    result, calls, space, _ = _run_recipe_race(
+        {
+            "stable": [(2, 0.860, 0.60), (5, 0.850, 0.55)],
+            "regularized": [(3, 0.858, 0.52), (6, 0.870, 0.45)],
+            "fast_fit": [(4, 0.800, 0.68)],
+        }
+    )
+    assert result["recipe"]["name"] == "regularized"
+    assert abs(result["val_acc"] - 0.870) < 1e-12
+    assert abs(result["model"].marker.item() - 6.0) < 1e-12
+    assert (
+        result["model"].search_optimizer_state["param_groups"][0]["marker"]
+        == 6.0
+    )
+    assert abs(
+        result["model"].independent_retry_state["marker"].item() - 1.0
+    ) < 1e-12
+
+    stable_model = next(
+        model
+        for model in space.models
+        if model.training_recipe["name"] == "stable"
+    )
+    assert abs(stable_model.marker.item() - 2.0) < 1e-12
+    stage_two = [call for call in calls if call["stage"] == 2]
+    assert {call["start_marker"] for call in stage_two} == {2.0, 3.0}
+    assert {call["optimizer_marker"] for call in stage_two} == {2.0, 3.0}
+
+
+def test_recipe_trial_score_uses_validation_loss_slope():
+    flat = {
+        "best_val_acc": 0.800,
+        "metrics_history": [
+            {"loss": 1.00},
+            {"loss": 0.99},
+        ],
+    }
+    improving = {
+        "best_val_acc": 0.799,
+        "metrics_history": [
+            {"loss": 1.00},
+            {"loss": 0.70},
+        ],
+    }
+    NAS._recipe_trial_score(flat)
+    NAS._recipe_trial_score(improving)
+    assert improving["selection_score"] > flat["selection_score"]
+
+
+def test_controller_evaluation_reports_cross_entropy_loss():
+    controller = object.__new__(NAS)
+    controller.device = torch.device("cpu")
+    controller.num_classes = 2
+    logits = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
+    targets = torch.tensor([0, 1])
+    metrics = controller._evaluate(torch.nn.Identity(), [(logits, targets)])
+    expected = torch.nn.functional.cross_entropy(logits, targets).item()
+    assert abs(metrics["loss"] - expected) < 1e-12
+    assert metrics["accuracy"] == 1.0
+    assert metrics["samples"] == 2
+
+
+def test_recipe_race_short_budget_falls_back_without_training():
+    result, calls, _, _ = _run_recipe_race(
+        {
+            "stable": [(2, 0.90, 0.50)],
+            "regularized": [(3, 0.91, 0.45)],
+            "fast_fit": [(4, 0.89, 0.55)],
+        },
+        remaining=20.0,
+        seconds_per_step=1.0,
+    )
+    assert calls == []
+    assert abs(result["val_acc"] - 0.84) < 1e-12
+    assert abs(result["model"].marker.item() - 1.0) < 1e-12
+
+
 if __name__ == "__main__":
     test_label_aware_slots_are_family_balanced()
     test_architectures_are_not_confounded_with_recipes()
     test_final_score_rewards_accuracy_and_rank_stability()
     test_search_plateau_keeps_state_and_reduces_lr()
+    test_recipe_race_preserves_a_stronger_incumbent()
+    test_recipe_race_restores_best_stage_and_matching_optimizer()
+    test_recipe_trial_score_uses_validation_loss_slope()
+    test_controller_evaluation_reports_cross_entropy_loss()
+    test_recipe_race_short_budget_falls_back_without_training()
     print("Controller refinement regression tests passed")

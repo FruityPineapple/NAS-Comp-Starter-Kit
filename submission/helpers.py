@@ -112,7 +112,11 @@ def inspect_data_properties(train_x):
             "is_structured": True,
         }
 
-    sample_size = min(n, 256)
+    bytes_per_float_sample = max(1, channels * height * width * 4)
+    byte_limited_samples = max(
+        1, int(64 * 1024 * 1024) // bytes_per_float_sample
+    )
+    sample_size = min(n, 256, byte_limited_samples)
     indices = np.linspace(0, n - 1, sample_size, dtype=np.int64)
     sample = np.asarray(train_x[indices], dtype=np.float32)
     if len(shape) == 3:
@@ -198,6 +202,119 @@ def inspect_data_properties(train_x):
             0.65 if max(height, width) >= 64 else 0.0,
         )
     )
+    if channels > 1:
+        channel_signatures = sample.mean(axis=(2, 3))
+        channel_std = channel_signatures.std(axis=0)
+        stable_channels = channel_std > 1e-5
+        if stable_channels.sum() >= 2:
+            correlations = np.corrcoef(
+                channel_signatures[:, stable_channels], rowvar=False
+            )
+            off_diagonal = correlations[
+                ~np.eye(correlations.shape[0], dtype=bool)
+            ]
+            mean_channel_correlation = float(
+                np.nanmean(np.abs(off_diagonal))
+            )
+        else:
+            mean_channel_correlation = 1.0
+    else:
+        mean_channel_correlation = 1.0
+    channel_independence_confidence = float(
+        max(
+            0.0,
+            min(
+                1.0,
+                (1.0 - mean_channel_correlation)
+                * (1.0 if 2 <= channels <= 12 else 0.35),
+            ),
+        )
+    )
+
+    continuous_confidence = max(
+        0.0, min(1.0, (0.95 - binary_like_fraction) / 0.50)
+    )
+    short_axis = min(height, width)
+    long_axis = max(height, width)
+    dense_sequence_confidence = float(
+        continuous_confidence
+        * (
+            1.0
+            if short_axis <= 16 and long_axis >= 64
+            else (
+                0.55
+                if short_axis <= 24 and long_axis >= 4 * short_axis
+                else 0.0
+            )
+        )
+    )
+    dense_sequence_direction = (
+        "height" if height <= width else "width"
+    )
+
+    dimension_ratio = max(channels, height, width) / max(
+        1, min(channels, height, width)
+    )
+    volumetric_confidence = float(
+        (
+            max(0.0, 1.0 - (dimension_ratio - 1.0) / 4.0)
+            * (0.55 + 0.45 * mean_channel_correlation)
+        )
+        if 4 <= channels <= 32 and min(height, width) >= 8
+        else 0.0
+    )
+    temporal_confidence = float(
+        (
+            0.35 + 0.65 * mean_channel_correlation
+        )
+        if 3 <= channels <= 32 and min(height, width) >= 8
+        else 0.0
+    )
+
+    uniqueness_sample = sample[
+        : min(sample.shape[0], 8)
+    ]
+    rounded_unique = int(
+        min(
+            257,
+            np.unique(np.round(uniqueness_sample, decimals=4)).size,
+        )
+    )
+    discrete_confidence = (
+        1.0
+        if rounded_unique <= 32
+        else max(0.0, 1.0 - (rounded_unique - 32) / 224.0)
+    )
+    board_confidence = float(
+        discrete_confidence
+        * (
+            1.0
+            if 4 <= min(height, width) and max(height, width) <= 16
+            else 0.0
+        )
+    )
+    natural_image_confidence = float(
+        (
+            0.85
+            if channels == 3
+            and not is_standardized
+            and not is_categorical_grid
+            else (
+                0.35
+                if channels in (1, 3)
+                and min(height, width) >= 24
+                and not is_categorical_grid
+                else 0.0
+            )
+        )
+    )
+    fixed_coordinate_confidence = float(
+        max(
+            position_sensitive_confidence,
+            board_confidence,
+            0.55 if is_standardized and channels > 1 else 0.0,
+        )
+    )
     is_categorical_grid = (
         channels == 1
         and max(sequence_width_confidence, sequence_height_confidence) >= 0.70
@@ -209,6 +326,13 @@ def inspect_data_properties(train_x):
         "sequence_width": sequence_width_confidence,
         "sequence_height": sequence_height_confidence,
         "factorized": factorized_confidence,
+        "dense_sequence": dense_sequence_confidence,
+        "channel_independent": channel_independence_confidence,
+        "volumetric": volumetric_confidence,
+        "temporal": temporal_confidence,
+        "board": board_confidence,
+        "fixed_coordinate": fixed_coordinate_confidence,
+        "natural_image": natural_image_confidence,
     }
 
     return {
@@ -234,6 +358,19 @@ def inspect_data_properties(train_x):
         "sequence_height_confidence": sequence_height_confidence,
         "position_sensitive_confidence": position_sensitive_confidence,
         "factorized_confidence": factorized_confidence,
+        "dense_sequence_confidence": dense_sequence_confidence,
+        "dense_sequence_direction": dense_sequence_direction,
+        "channel_independence_confidence": (
+            channel_independence_confidence
+        ),
+        "mean_channel_correlation": mean_channel_correlation,
+        "volumetric_confidence": volumetric_confidence,
+        "temporal_confidence": temporal_confidence,
+        "board_confidence": board_confidence,
+        "fixed_coordinate_confidence": fixed_coordinate_confidence,
+        "natural_image_confidence": natural_image_confidence,
+        "estimated_unique_values": rounded_unique,
+        "fingerprint_samples": int(sample_size),
         "representation_hypotheses": representation_hypotheses,
         "is_categorical_grid": bool(is_categorical_grid),
         "is_structured": bool(
