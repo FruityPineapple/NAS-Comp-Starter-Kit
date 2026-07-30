@@ -102,6 +102,10 @@ def test_case(name, shape, num_classes, n_train=200, n_valid=50, n_test=50):
     # 6. Metadata should be enriched with data_props
     assert 'data_props' in metadata, "FAIL: metadata should contain 'data_props'"
     assert 'batch_size' in metadata, "FAIL: metadata should contain 'batch_size'"
+    assert metadata['test_num_batches'] == len(test_loader), \
+        "FAIL: test batch count missing or incorrect"
+    assert metadata['test_num_samples'] == n_test, \
+        "FAIL: test sample count missing or incorrect"
 
     # 7. Total test samples should be preserved (no data loss)
     total_test_samples = sum(

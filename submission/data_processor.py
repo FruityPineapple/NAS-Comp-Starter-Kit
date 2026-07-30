@@ -57,6 +57,18 @@ def build_augmentation_pipeline(data_props, mean, std):
     min_dim = min(height, width)
     normalize = transforms.Normalize(mean, std)
 
+    sequence_confidence = max(
+        data_props.get("sequence_width_confidence", 0.0),
+        data_props.get("sequence_height_confidence", 0.0),
+    )
+    if sequence_confidence >= 0.55:
+        print(
+            "  [DataProcessor] Position-sensitive sequence/grid detected; "
+            "disabling geometric augmentation"
+        )
+        pipeline = transforms.Compose([normalize])
+        return pipeline, pipeline
+
     if data_props["is_small"]:
         pipeline = transforms.Compose([normalize])
         return pipeline, pipeline
@@ -80,9 +92,14 @@ def build_augmentation_pipeline(data_props, mean, std):
     if min_dim >= 16:
         if is_grayscale and is_structured:
             # Mild translation helps glyphs. Rotations/reflections can change
-            # their label and are deliberately avoided.
+            # their label and are deliberately avoided.  Ambiguous structured
+            # inputs receive it stochastically so identity samples remain in
+            # every epoch.
             augmentations.append(
-                transforms.RandomAffine(degrees=0, translate=(0.06, 0.06))
+                transforms.RandomApply(
+                    [transforms.RandomAffine(degrees=0, translate=(0.05, 0.05))],
+                    p=0.50,
+                )
             )
         else:
             pad = max(2, min_dim // 16)
@@ -139,10 +156,22 @@ class DataProcessor:
         )
         nonzero_counts = class_counts[class_counts > 0]
         data_props["class_imbalance_ratio"] = (
-            float(nonzero_counts.max() / max(1.0, nonzero_counts.mean()))
+            float(nonzero_counts.max() / max(1.0, nonzero_counts.min()))
             if len(nonzero_counts)
             else 1.0
         )
+        if len(nonzero_counts):
+            inverse_sqrt = np.sqrt(
+                float(nonzero_counts.mean()) / np.maximum(class_counts, 1)
+            )
+            inverse_sqrt = inverse_sqrt / max(1e-8, float(inverse_sqrt.mean()))
+            data_props["class_weights"] = inverse_sqrt.astype(np.float32).tolist()
+        else:
+            data_props["class_weights"] = [1.0] * int(
+                self.metadata["num_classes"]
+            )
+        data_props["train_samples"] = int(len(self.train_x))
+        data_props["valid_samples"] = int(len(self.valid_x))
         self._log_data_props(data_props)
         self.metadata["data_props"] = data_props
 
@@ -219,6 +248,10 @@ class DataProcessor:
             drop_last=False,
             **common
         )
+        self.metadata["train_num_batches"] = len(train_loader)
+        self.metadata["valid_num_batches"] = len(valid_loader)
+        self.metadata["test_num_batches"] = len(test_loader)
+        self.metadata["test_num_samples"] = len(test_dataset)
 
         print(
             "  [DataProcessor] Complete. Time remaining: ~{}".format(
@@ -344,6 +377,26 @@ class DataProcessor:
                 props.get("is_structured", False),
                 props.get("is_standardized", False),
                 props.get("low_variance_color", False),
+            )
+        )
+        print(
+            "    - Categorical grid: {} (binary={:.3f}, density={:.4f}, "
+            "one-hot columns={:.3f}, rows={:.3f})".format(
+                props.get("is_categorical_grid", False),
+                props.get("binary_like_fraction", 0.0),
+                props.get("active_density", 0.0),
+                props.get("one_hot_column_ratio", 0.0),
+                props.get("one_hot_row_ratio", 0.0),
+            )
+        )
+        print(
+            "    - Representation hypotheses: {}".format(
+                {
+                    name: round(float(confidence), 3)
+                    for name, confidence in props.get(
+                        "representation_hypotheses", {}
+                    ).items()
+                }
             )
         )
         print(

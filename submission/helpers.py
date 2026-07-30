@@ -99,6 +99,16 @@ def inspect_data_properties(train_x):
             "value_max": 0.0,
             "is_standardized": False,
             "low_variance_color": False,
+            "binary_like_fraction": 0.0,
+            "active_density": 0.0,
+            "one_hot_column_ratio": 0.0,
+            "one_hot_row_ratio": 0.0,
+            "sequence_width_confidence": 0.0,
+            "sequence_height_confidence": 0.0,
+            "position_sensitive_confidence": 0.0,
+            "factorized_confidence": 0.0,
+            "representation_hypotheses": {"spatial": 1.0},
+            "is_categorical_grid": False,
             "is_structured": True,
         }
 
@@ -131,6 +141,76 @@ def inspect_data_properties(train_x):
         and spatial_variance < 0.15
     )
 
+    # Some competition datasets encode a categorical sequence as a sparse
+    # binary image: rows identify symbols and columns identify positions.  Such
+    # inputs are not translation-invariant images.  Detect the representation
+    # from its contents rather than from a dataset name.
+    binary_distance = np.minimum(np.abs(sample), np.abs(sample - 1.0))
+    binary_like_fraction = float(np.mean(binary_distance <= 1e-4))
+    if binary_like_fraction >= 0.98:
+        active = sample > 0.5
+        active_density = float(np.mean(active))
+        active_per_column = np.sum(active, axis=2)
+        active_per_row = np.sum(active, axis=3)
+        one_hot_column_ratio = float(np.mean(active_per_column == 1))
+        one_hot_row_ratio = float(np.mean(active_per_row == 1))
+    else:
+        active_density = 0.0
+        one_hot_column_ratio = 0.0
+        one_hot_row_ratio = 0.0
+
+    binary_confidence = min(1.0, max(0.0, (binary_like_fraction - 0.90) / 0.08))
+    sparse_confidence = (
+        1.0
+        if 0.005 <= active_density <= 0.15
+        else max(0.0, 1.0 - abs(active_density - 0.075) / 0.20)
+    )
+    shape_confidence = 1.0 if min(height, width) >= 12 else 0.25
+    sequence_width_confidence = float(
+        binary_confidence
+        * sparse_confidence
+        * shape_confidence
+        * max(one_hot_column_ratio, 0.35 * one_hot_row_ratio)
+    )
+    sequence_height_confidence = float(
+        binary_confidence
+        * sparse_confidence
+        * shape_confidence
+        * max(one_hot_row_ratio, 0.35 * one_hot_column_ratio)
+    )
+    position_sensitive_confidence = float(
+        max(
+            sequence_width_confidence,
+            sequence_height_confidence,
+            0.55 if (channels == 1 and is_small) else 0.0,
+            0.45
+            if (
+                channels == 1
+                and max(height, width) >= 2 * max(1, min(height, width))
+            )
+            else 0.0,
+        )
+    )
+    factorized_confidence = float(
+        max(
+            0.25,
+            0.75 if channels >= 3 else 0.0,
+            0.65 if max(height, width) >= 64 else 0.0,
+        )
+    )
+    is_categorical_grid = (
+        channels == 1
+        and max(sequence_width_confidence, sequence_height_confidence) >= 0.70
+    )
+    representation_hypotheses = {
+        # Spatial structure is never ruled out from a fingerprint alone.
+        "spatial": 1.0,
+        "position_sensitive": position_sensitive_confidence,
+        "sequence_width": sequence_width_confidence,
+        "sequence_height": sequence_height_confidence,
+        "factorized": factorized_confidence,
+    }
+
     return {
         "channels": int(channels),
         "height": int(height),
@@ -146,5 +226,21 @@ def inspect_data_properties(train_x):
         "value_max": value_max,
         "is_standardized": bool(is_standardized),
         "low_variance_color": bool(low_variance_color),
-        "is_structured": bool(is_small or is_grayscale or is_standardized),
+        "binary_like_fraction": binary_like_fraction,
+        "active_density": active_density,
+        "one_hot_column_ratio": one_hot_column_ratio,
+        "one_hot_row_ratio": one_hot_row_ratio,
+        "sequence_width_confidence": sequence_width_confidence,
+        "sequence_height_confidence": sequence_height_confidence,
+        "position_sensitive_confidence": position_sensitive_confidence,
+        "factorized_confidence": factorized_confidence,
+        "representation_hypotheses": representation_hypotheses,
+        "is_categorical_grid": bool(is_categorical_grid),
+        "is_structured": bool(
+            is_small
+            or is_grayscale
+            or is_standardized
+            or is_categorical_grid
+            or position_sensitive_confidence >= 0.50
+        ),
     }
