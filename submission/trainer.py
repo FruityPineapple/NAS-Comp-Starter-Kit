@@ -723,7 +723,11 @@ class Trainer:
         ema_state = self._cpu_state_dict(model)
         checkpoint_pool = [(initial_val_acc, self._cpu_state_dict(model))]
         best_recipe = dict(self.recipe)
-        attempt_best_val = initial_val_acc
+        # The immutable starting checkpoint is the recovery target, not
+        # evidence that the optimizer path has recovered it. Keeping it as
+        # the attempt best made the first attempt impossible to classify as
+        # a failed recovery even when every trained epoch was worse.
+        attempt_trained_best_val = -float("inf")
         attempt_start_best_val = best_val_acc
         attempt_epochs = 0
         epochs_without_improvement = 0
@@ -891,8 +895,8 @@ class Trainer:
                 else 0.70 * measured_epoch_time + 0.30 * actual_epoch_time
             )
 
-            if val_acc > attempt_best_val + 1e-6:
-                attempt_best_val = val_acc
+            if val_acc > attempt_trained_best_val + 1e-6:
+                attempt_trained_best_val = val_acc
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
@@ -999,7 +1003,7 @@ class Trainer:
             )
             rotation_reason = self._attempt_rotation_reason(
                 attempt_epochs=attempt_epochs,
-                attempt_best_val=attempt_best_val,
+                attempt_best_val=attempt_trained_best_val,
                 attempt_start_best_val=attempt_start_best_val,
                 epochs_without_improvement=epochs_without_improvement,
                 train_accuracy=train_acc,
@@ -1047,14 +1051,15 @@ class Trainer:
                     torch.manual_seed(retry_seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(retry_seed)
-                    attempt_best_val = self._evaluate(model)
-                    if attempt_best_val > best_val_acc:
-                        best_val_acc = attempt_best_val
+                    retry_baseline_val = self._evaluate(model)
+                    if retry_baseline_val > best_val_acc:
+                        best_val_acc = retry_baseline_val
                         best_recipe = dict(self.recipe)
                         best_model_state = {
                             key: value.detach().cpu().clone()
                             for key, value in model.state_dict().items()
                         }
+                    attempt_trained_best_val = -float("inf")
                     attempt_start_best_val = best_val_acc
                     attempt_epochs = 0
                     epochs_without_improvement = 0
@@ -1081,7 +1086,7 @@ class Trainer:
                         "checkpoint: recipe={} | baseline={:.2f}%{}{}".format(
                             independent_retry_count + 1,
                             self.recipe.get("name", "stable"),
-                            attempt_best_val * 100,
+                            retry_baseline_val * 100,
                             " | benchmark still unmet"
                             if below_benchmark
                             else "",
@@ -1129,13 +1134,14 @@ class Trainer:
                     torch.manual_seed(challenger_seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(challenger_seed)
-                    attempt_best_val = self._evaluate(model)
-                    if attempt_best_val > best_val_acc + 1e-6:
-                        best_val_acc = attempt_best_val
+                    challenger_baseline_val = self._evaluate(model)
+                    if challenger_baseline_val > best_val_acc + 1e-6:
+                        best_val_acc = challenger_baseline_val
                         best_recipe = dict(self.recipe)
                         best_model_state = self._cpu_state_dict(model)
                         best_model_prototype = copy.deepcopy(model).cpu()
                         best_architecture_id = current_architecture_id
+                    attempt_trained_best_val = -float("inf")
                     attempt_start_best_val = best_val_acc
                     attempt_epochs = 0
                     epochs_without_improvement = 0
@@ -1153,7 +1159,7 @@ class Trainer:
                     ema_state = self._cpu_state_dict(model)
                     checkpoint_pool = [
                         (
-                            attempt_best_val,
+                            challenger_baseline_val,
                             self._cpu_state_dict(model),
                         )
                     ]
@@ -1161,7 +1167,7 @@ class Trainer:
                         "  [Trainer] Anytime second-architecture attempt: "
                         "{} | baseline={:.2f}% | reason={}".format(
                             self.challenger_spec,
-                            attempt_best_val * 100,
+                            challenger_baseline_val * 100,
                             self.challenger_reason,
                         )
                     )
@@ -1207,7 +1213,7 @@ class Trainer:
                     torch.manual_seed(continuation_seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(continuation_seed)
-                    attempt_best_val = best_val_acc
+                    attempt_trained_best_val = -float("inf")
                     attempt_start_best_val = best_val_acc
                     attempt_epochs = 0
                     epochs_without_improvement = 0

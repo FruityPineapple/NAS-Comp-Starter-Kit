@@ -48,8 +48,10 @@ multi-hour runs. Search and prediction deadlines remain protected.
 - Clock-driven final attempts across every untried recipe, one optional tied
   or materially smaller risk-insurance architecture challenger, fresh-seed
   continuations, EMA, and tested same-architecture checkpoint averaging.
-- Early rotation of attempts that fail to recover the immutable baseline,
-  while productive slow-recovery attempts retain a longer runway.
+- Early rotation of attempts whose post-start epochs fail to recover the
+  immutable baseline, while productive slow-recovery attempts retain a
+  longer runway. The untouched starting checkpoint is not itself counted as
+  optimizer recovery evidence.
 - TTA only for flip policies that passed both invariance and functional
   validation probes.
 - Recursive prediction splitting preserves complete test order after OOM.

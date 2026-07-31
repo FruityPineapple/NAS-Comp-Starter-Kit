@@ -1487,6 +1487,27 @@ A new session should not have to rediscover the following:
     materially smaller checkpoint is kept when the winner is demonstrably
     brittle. It is tried only after the primary architecture's distinct
     recipes and never participates in the same forward pass.
+24. **The three-new-dataset generalization run exposed initial-attempt recovery
+    accounting, not a new architecture failure.** The completed Chester,
+    Sokoto, and Conway run scored 6.660 adjusted points. On Sokoto, every SGD
+    epoch remained below the preserved 31.21% warm checkpoint, but the
+    untouched checkpoint had been initialized as the attempt's own best and
+    therefore made `failed_to_recover` impossible. Trainer now tracks
+    post-start accuracy separately while keeping the warm checkpoint as the
+    immutable global best. This is the sole controller change selected for
+    the final iteration.
+
+### Final-iteration recovery-accounting task
+
+- [x] Keep the warm/search checkpoint as the immutable global best and
+  recovery target.
+- [x] Exclude the untouched starting checkpoint from the current optimizer
+  attempt's post-start best accuracy.
+- [x] Reset post-start recovery evidence for initial, alternative,
+  challenger, and continuation attempts.
+- [x] Add a regression trajectory matching the Sokoto failure mode.
+- [x] Update the active architecture documentation without changing NAS,
+  recipes, score thresholds, or competition-controlled files.
 
 ## 12. Reference links
 

@@ -291,6 +291,14 @@ and rotates only after a long plateau at a substantially decayed LR. A large
 gap prioritizes the regularized alternative. These conditions are based only
 on validation behavior and resource measurements.
 
+The immutable checkpoint at the start of an attempt is only its recovery
+target. It is not counted as accuracy achieved by the subsequent optimizer
+path. Each initial, alternative, challenger, and continuation attempt tracks
+its best post-start epoch separately, so an optimizer that immediately
+degrades a good NAS checkpoint can be rotated after the guarded minimum
+runway. The unchanged starting checkpoint remains available as the global
+best throughout.
+
 The global best validation checkpoint never regresses. If a different
 architecture wins, Trainer returns it and updates the model used by
 `predict()`.
