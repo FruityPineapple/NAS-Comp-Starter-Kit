@@ -110,6 +110,8 @@ def test_representation_probe_promotes_with_progressive_offsets():
     controller.metadata = {}
     gains = {"spatial": 0.03, "factorized": 0.06, "axis_width": 0.09}
     starts = []
+    seed_calls = []
+    controller._seed_everything = seed_calls.append
 
     class _ProbeModel(torch.nn.Module):
         def __init__(self, family):
@@ -188,6 +190,8 @@ def test_representation_probe_promotes_with_progressive_offsets():
         "axis_width",
         "factorized",
     ]
+    assert seed_calls[:6] == [1231, 1831] * 3
+    assert seed_calls[6:] == [2231, 2231]
 
 
 if __name__ == "__main__":

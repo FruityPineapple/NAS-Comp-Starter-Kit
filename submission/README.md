@@ -31,18 +31,23 @@ multi-hour runs. Search and prediction deadlines remain protected.
   feature-reuse families.
 - Label-trained representation probes promote two families, with a third only
   on an uncertainty tie; macro search then restores full compact-to-wide size
-  coverage inside the promoted families.
+  coverage and reserves feasible compact/central/capacity anchors inside the
+  promoted families.
+- Common deterministic seeds per paired representation stage, macro round,
+  and refinement pass; candidate list position never changes a model's trial.
 - Progressive data coverage, optimizer-state continuation, logical-batch
   microbatch accumulation, and OOM retry.
 - Best-stage architecture restoration and confirmation-dominant finalist
-  selection, with historical rank used only for statistical ties.
+  selection, with late brittleness evidence and historical rank used only for
+  statistical ties. One plausibly slow-starting capacity anchor receives at
+  most two insured full-data passes.
 - Incumbent-safe two-stage recipe selection using uncertainty-aware
   confirmation evidence.
 - AdamW controls plus zero-smoothing SGD/Nesterov with monotonic, no-restart
   cosine decay.
-- Clock-driven final attempts across every untried recipe, an optional tied
-  architecture challenger, fresh-seed continuations, EMA, and tested
-  same-architecture checkpoint averaging.
+- Clock-driven final attempts across every untried recipe, one optional tied
+  or materially smaller risk-insurance architecture challenger, fresh-seed
+  continuations, EMA, and tested same-architecture checkpoint averaging.
 - Early rotation of attempts that fail to recover the immutable baseline,
   while productive slow-recovery attempts retain a longer runway.
 - TTA only for flip policies that passed both invariance and functional

@@ -47,6 +47,24 @@ class _TinyRecipeSpace:
         return model
 
 
+class _TinyArchitectureModel(_TinyRecipeModel):
+    def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
+
+
+class _TinyArchitectureSpace:
+    max_safe_stages = 4
+
+    def __init__(self, current_seed, initializations):
+        self.current_seed = current_seed
+        self.initializations = initializations
+
+    def build_model(self, spec):
+        self.initializations[spec] = self.current_seed()
+        return _TinyArchitectureModel(spec)
+
+
 def _run_recipe_race(
     schedule,
     incumbent_accuracy=0.84,
@@ -237,6 +255,280 @@ def test_label_aware_slots_are_family_balanced():
     assert set(counts.values()) == {2}
 
 
+def test_label_aware_slots_reserve_feasible_anchor_endpoints():
+    controller = object.__new__(NAS)
+    controller.input_h = 27
+    controller.input_w = 18
+    space = SimpleNamespace(max_safe_stages=4)
+    compact, central, capacity = controller._anchor_specs("spatial", space)
+    smaller_decoy = ArchSpec(
+        2, 16, 1, "basic", 3, False, 3, "spatial"
+    )
+    larger_decoy = ArchSpec(
+        4, 64, 3, "basic", 5, True, 7, "spatial"
+    )
+    entries = [
+        {"spec": smaller_decoy, "params": 1_000},
+        {"spec": larger_decoy, "params": 2_000_000},
+        {"spec": central, "params": 90_000},
+        {"spec": compact, "params": 20_000},
+        {"spec": capacity, "params": 500_000},
+    ]
+    selected = controller._select_label_aware_entries(
+        entries,
+        2,
+        anchor_specs_by_family={
+            "spatial": [compact, central, capacity]
+        },
+    )
+    assert {entry["spec"] for entry in selected} == {compact, capacity}
+
+
+def _run_ordered_macro_seed_trial(specs):
+    controller = object.__new__(NAS)
+    controller.seed = 17
+    controller.input_h = 16
+    controller.input_w = 16
+    controller.num_classes = 2
+    controller.data_props = {}
+    controller.metadata = {}
+    controller.device = torch.device("cpu")
+    controller.clock = _ConstantClock(100.0)
+    controller.train_loader = [None] * 4
+    current_seed = {"value": None}
+    initializations = {}
+    training_seeds = {}
+
+    def record_seed(seed):
+        current_seed["value"] = int(seed)
+
+    def fake_train(
+        self,
+        model,
+        batch_source,
+        max_steps,
+        time_quantum,
+        deadline_remaining,
+        recipe,
+        optimizer_state=None,
+        start_step=0,
+    ):
+        training_seeds[model.spec] = current_seed["value"]
+        accuracy = 0.60 if model.spec.model_family == "spatial" else 0.50
+        return (
+            int(max_steps),
+            0.1,
+            False,
+            {"state": {}, "param_groups": [{"lr": 1e-3}]},
+            {
+                "examples_seen": int(max_steps),
+                "train_accuracy": accuracy,
+                "final_lr": 1e-3,
+                "peak_memory_mb": 0.0,
+            },
+        )
+
+    def fake_evaluate(self, model, source=None):
+        accuracy = 0.60 if model.spec.model_family == "spatial" else 0.50
+        return {
+            "accuracy": accuracy,
+            "balanced_accuracy": accuracy,
+            "loss": 0.70,
+            "margin": 0.20,
+            "samples": 100,
+        }
+
+    controller._seed_everything = record_seed
+    controller._train_low_fidelity = MethodType(fake_train, controller)
+    controller._evaluate = MethodType(fake_evaluate, controller)
+    controller._make_refinement_loader = MethodType(
+        lambda self: None, controller
+    )
+    controller._recipe_tournament = MethodType(
+        lambda self, space, winner, *args, **kwargs: winner,
+        controller,
+    )
+    space = _TinyArchitectureSpace(
+        lambda: current_seed["value"], initializations
+    )
+    ranked = [
+        {"spec": spec, "params": 10_000, "proxy_evaluated": True}
+        for spec in specs
+    ]
+    controller._successive_halving(
+        space,
+        ranked,
+        n_top=2,
+        cached_batches=[None] * 4,
+        validation_batches=[None],
+        round_plan=((1.0, 1),),
+        deadline_remaining=0.0,
+    )
+    return initializations, training_seeds
+
+
+def test_macro_seed_schedule_is_candidate_order_independent():
+    spatial = ArchSpec(3, 32, 2, "basic", 3, True, 3, "spatial")
+    factorized = ArchSpec(
+        3, 32, 2, "basic", 3, True, 3, "factorized"
+    )
+    forward = _run_ordered_macro_seed_trial([spatial, factorized])
+    reverse = _run_ordered_macro_seed_trial([factorized, spatial])
+    assert forward == reverse
+    assert set(forward[0].values()) == {517}
+    assert set(forward[1].values()) == {1017}
+
+
+def test_capacity_anchor_gets_bounded_late_repechage():
+    controller = object.__new__(NAS)
+    normal_best = {
+        "utility": 0.42,
+        "val_acc": 0.42,
+        "val_samples": 1000,
+    }
+    normal_cutoff = {
+        "utility": 0.40,
+        "val_acc": 0.40,
+        "val_samples": 1000,
+    }
+    capacity = {
+        "utility": 0.38,
+        "val_acc": 0.38,
+        "val_samples": 1000,
+        "val_history": [0.30, 0.38],
+        "anchor_kind": "capacity",
+    }
+    results = [normal_best, normal_cutoff, capacity]
+    early, insured = controller._select_halving_survivors(results, 2)
+    assert insured is capacity
+    assert len(early) == 2
+    assert capacity in early
+    late, insured = controller._select_halving_survivors(
+        results, 2, final_round=True
+    )
+    assert insured is capacity
+    assert late == [normal_best, normal_cutoff, capacity]
+
+    far_behind = dict(capacity)
+    far_behind.update(
+        {
+            "utility": 0.20,
+            "val_acc": 0.20,
+            "val_history": [0.19, 0.20],
+        }
+    )
+    bounded, insured = controller._select_halving_survivors(
+        [normal_best, normal_cutoff, far_behind], 2, final_round=True
+    )
+    assert insured is None
+    assert bounded == [normal_best, normal_cutoff]
+
+
+def test_insured_anchor_is_parked_and_handed_off_as_one_challenger():
+    controller = object.__new__(NAS)
+    controller.seed = 17
+    controller.input_h = 27
+    controller.input_w = 18
+    controller.num_classes = 6
+    controller.data_props = {}
+    controller.metadata = {}
+    controller.device = torch.device("cpu")
+    controller.clock = _ConstantClock(100.0)
+    controller.train_loader = [None] * 4
+    space_stub = SimpleNamespace(max_safe_stages=4)
+    compact, central, capacity = controller._anchor_specs(
+        "spatial", space_stub
+    )
+    calls = {compact: 0, central: 0, capacity: 0}
+
+    class _AnchorSpace(_TinyArchitectureSpace):
+        pass
+
+    current_seed = {"value": None}
+    initializations = {}
+    space = _AnchorSpace(lambda: current_seed["value"], initializations)
+
+    def record_seed(seed):
+        current_seed["value"] = int(seed)
+
+    def fake_train(
+        self,
+        model,
+        batch_source,
+        max_steps,
+        time_quantum,
+        deadline_remaining,
+        recipe,
+        optimizer_state=None,
+        start_step=0,
+    ):
+        calls[model.spec] += 1
+        train_accuracy = 1.0 if model.spec == central else 0.50
+        return (
+            int(max_steps),
+            0.1,
+            False,
+            {"state": {}, "param_groups": [{"lr": 1e-3}]},
+            {
+                "examples_seen": int(max_steps),
+                "train_accuracy": train_accuracy,
+                "final_lr": 1e-3,
+                "peak_memory_mb": 0.0,
+            },
+        )
+
+    def fake_evaluate(self, model, source=None):
+        if model.spec == central:
+            accuracy, loss = 0.42, 2.20
+        elif model.spec == compact:
+            accuracy, loss = 0.40, 1.70
+        else:
+            accuracy = 0.38 if calls[capacity] <= 1 else 0.39
+            loss = 1.55
+        return {
+            "accuracy": accuracy,
+            "balanced_accuracy": accuracy,
+            "loss": loss,
+            "margin": 0.20,
+            "samples": 1000,
+        }
+
+    controller._seed_everything = record_seed
+    controller._train_low_fidelity = MethodType(fake_train, controller)
+    controller._evaluate = MethodType(fake_evaluate, controller)
+    controller._make_refinement_loader = MethodType(
+        lambda self: [None] * 4, controller
+    )
+    controller._recipe_tournament = MethodType(
+        lambda self, space, winner, *args, **kwargs: winner,
+        controller,
+    )
+    ranked = [
+        {"spec": compact, "params": 7_000_000},
+        {"spec": central, "params": 8_000_000},
+        {"spec": capacity, "params": 1_000_000},
+    ]
+    winner = controller._successive_halving(
+        space,
+        ranked,
+        n_top=3,
+        cached_batches=[None] * 4,
+        validation_batches=["selection"],
+        confirmation_batches=["confirmation"],
+        round_plan=((1.0, 2),),
+        deadline_remaining=0.0,
+    )
+    bundle = winner["model"].architecture_challenger_bundle
+    assert winner["spec"] == central
+    assert calls[capacity] == 3
+    assert controller.metadata["nas_anchor_insurance_parked"] == 1
+    assert bundle["spec"] == capacity
+    assert bundle["reason"] == "efficient_overfit_insurance"
+    assert not any(
+        module is bundle["model"] for module in winner["model"].modules()
+    )
+
+
 def test_architectures_are_not_confounded_with_recipes():
     controller = object.__new__(NAS)
     controller.input_h = 28
@@ -379,6 +671,74 @@ def test_rank_history_is_only_a_confirmation_tie_break():
     )
     assert tie_threshold is not None
     assert ordered[0] is stable
+
+
+def test_late_overfit_risk_breaks_only_a_confirmation_tie():
+    controller = object.__new__(NAS)
+    controller.num_classes = 6
+    overfit = {
+        "selection_val_acc": 0.43,
+        "selection_val_loss": 2.20,
+        "confirmation_val_acc": 0.42,
+        "confirmation_val_loss": 2.20,
+        "confirmation_samples": 1000,
+        "train_stats": {"train_accuracy": 1.0},
+        "refinement_history": [0.41, 0.42],
+        "val_history": [0.38, 0.41, 0.43],
+    }
+    stable = {
+        "selection_val_acc": 0.42,
+        "selection_val_loss": 1.55,
+        "confirmation_val_acc": 0.42,
+        "confirmation_val_loss": 1.55,
+        "confirmation_samples": 1000,
+        "train_stats": {"train_accuracy": 0.48},
+        "refinement_history": [0.41, 0.42],
+        "val_history": [0.35, 0.40, 0.42],
+    }
+    ordered, tie_threshold = controller._order_final_results(
+        [overfit, stable]
+    )
+    assert tie_threshold is not None
+    assert ordered[0] is stable
+
+
+def test_risky_winner_retains_materially_smaller_challenger():
+    controller = object.__new__(NAS)
+    controller.num_classes = 6
+    winner = {
+        "params": 8_000_000,
+        "confirmation_val_acc": 0.42,
+        "confirmation_val_loss": 2.20,
+        "train_stats": {"train_accuracy": 1.0},
+        "refinement_history": [0.40, 0.42],
+    }
+    efficient = {
+        "params": 1_000_000,
+        "confirmation_val_acc": 0.38,
+        "confirmation_val_loss": 1.55,
+        "train_stats": {"train_accuracy": 0.50},
+        "refinement_history": [0.37, 0.38],
+    }
+    too_large = {
+        "params": 7_000_000,
+        "confirmation_val_acc": 0.41,
+        "confirmation_val_loss": 1.60,
+        "train_stats": {"train_accuracy": 0.50},
+        "refinement_history": [0.40, 0.41],
+    }
+    challenger, reason = controller._select_retained_architecture_challenger(
+        winner, [winner, too_large, efficient]
+    )
+    assert challenger is efficient
+    assert reason == "efficient_overfit_insurance"
+    not_ready = dict(winner)
+    not_ready.pop("refinement_history")
+    challenger, reason = controller._select_retained_architecture_challenger(
+        not_ready, [not_ready, efficient]
+    )
+    assert challenger is None
+    assert reason is None
 
 
 def test_refinement_checkpoint_restores_weights_and_optimizer():
@@ -639,11 +999,17 @@ def test_recipe_race_short_budget_falls_back_without_training():
 
 if __name__ == "__main__":
     test_label_aware_slots_are_family_balanced()
+    test_label_aware_slots_reserve_feasible_anchor_endpoints()
+    test_macro_seed_schedule_is_candidate_order_independent()
+    test_capacity_anchor_gets_bounded_late_repechage()
+    test_insured_anchor_is_parked_and_handed_off_as_one_challenger()
     test_architectures_are_not_confounded_with_recipes()
     test_promoted_pool_restores_high_capacity_size_strata()
     test_final_score_does_not_let_rank_override_final_accuracy()
     test_clear_confirmation_winner_cannot_be_overturned_by_history()
     test_rank_history_is_only_a_confirmation_tie_break()
+    test_late_overfit_risk_breaks_only_a_confirmation_tie()
+    test_risky_winner_retains_materially_smaller_challenger()
     test_refinement_checkpoint_restores_weights_and_optimizer()
     test_search_plateau_keeps_state_and_reduces_lr()
     test_recipe_race_preserves_a_stronger_incumbent()

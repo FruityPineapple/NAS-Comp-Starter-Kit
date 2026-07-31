@@ -78,6 +78,11 @@ class Trainer:
         self.challenger_val_acc = float(
             challenger_bundle.get("val_acc", 0.0)
         )
+        self.challenger_params = int(challenger_bundle.get("params", 0))
+        self.challenger_reason = challenger_bundle.get(
+            "reason", "uncertainty_tie"
+        )
+        self.challenger_risk = float(challenger_bundle.get("risk", 0.0))
         self.benchmark = (
             float(metadata["benchmark"])
             if metadata.get("benchmark") is not None
@@ -1154,9 +1159,10 @@ class Trainer:
                     ]
                     print(
                         "  [Trainer] Anytime second-architecture attempt: "
-                        "{} | baseline={:.2f}%".format(
+                        "{} | baseline={:.2f}% | reason={}".format(
                             self.challenger_spec,
                             attempt_best_val * 100,
+                            self.challenger_reason,
                         )
                     )
                     continue

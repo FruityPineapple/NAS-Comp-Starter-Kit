@@ -235,6 +235,9 @@ def test_dormant_challenger_is_not_a_registered_branch():
         "model": challenger,
         "spec": "candidate",
         "val_acc": 0.5,
+        "params": 123,
+        "reason": "efficient_overfit_insurance",
+        "risk": 0.25,
     }
     assert (
         sum(parameter.numel() for parameter in primary.parameters())
@@ -249,6 +252,9 @@ def test_dormant_challenger_is_not_a_registered_branch():
         _ConstantClock(),
     )
     assert trainer.challenger_model is challenger
+    assert trainer.challenger_params == 123
+    assert trainer.challenger_reason == "efficient_overfit_insurance"
+    assert trainer.challenger_risk == 0.25
     assert not hasattr(primary, "architecture_challenger_bundle")
 
 

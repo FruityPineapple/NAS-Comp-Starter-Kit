@@ -119,6 +119,9 @@ top-two probability margin, examples seen, progressive data cursor, seed
 schedule, final learning rate, elapsed time, examples/second, and CUDA peak
 allocation. Accuracy remains the dominant ranking signal. Loss slope,
 uncertainty, train/validation gap, and efficiency are bounded near-tie terms.
+Absolute cross-entropy relative to the uniform-class baseline and
+train/validation separation become architecture-risk evidence only after
+meaningful refinement; they do not penalize broad undertrained candidates.
 
 ## 6. Hierarchical NAS controller
 
@@ -158,8 +161,11 @@ clock or evidence is insufficient, all represented families remain eligible.
 After promotion, the controller restores every feasible specification from
 the promoted families before selecting macro finalists. Deterministic
 log-parameter quantiles provide compact, medium, and high-capacity coverage;
-proxy rank breaks only same-size ties. The number of label-trained finalists
-does not increase.
+proxy rank breaks only same-size ties. Feasible compact, central, and capacity
+anchors are reserved before remaining quota slots are filled. With two family
+slots the compact and capacity endpoints are retained; with three, all three
+references are retained. The number of initial label-trained finalists does
+not increase.
 
 Every controller evaluation first places its model on the controller device;
 this includes newly constructed probes and probes parked on CPU between
@@ -183,17 +189,40 @@ matching optimizer state, step count, and data cursor. That state is restored
 before final selection, so a later partial or degrading pass cannot erase a
 stronger refinement checkpoint.
 
+Representation probes use one common initialization/training seed per equal
+stage. Macro candidates likewise use one common initialization seed, one
+common seed per fidelity round, and one common seed per refinement pass.
+Candidate list position never enters these seeds. This common-random-number
+design prevents reordering or inserting another candidate from changing an
+existing architecture's stochastic trial.
+
+One capacity anchor can receive bounded late-fidelity insurance when it falls
+just below a halving cutoff but its recent gain or sampling uncertainty still
+makes elimination premature. Before the last round it replaces only the
+weakest normal survivor, preserving the scheduled candidate count. The last
+round may carry it as one extra reference for at most two insured equal
+full-data passes; then only the best two continue. If the reference earns a
+top-two utility it continues on merit, not insurance. The allowable deficit is
+bounded between 2.5 and 8 raw percentage points of accuracy from observed
+gain and uncertainty. No dataset identifier participates in this policy.
+
 The last architectures are compared on both validation splits. A candidate
 that clearly wins confirmation accuracy cannot be overturned by adaptive
 history. When confirmation accuracies overlap within a bounded sampling
 interval, confirmation loss resolves the tie, followed by the combined
-selection/confirmation score and finally historical rank. Historical rank is
-therefore strictly a tie-break rather than an additive accuracy surrogate.
+selection/confirmation score and finally historical rank. Within that tie,
+lower late architecture risk (train/validation gap plus cross-entropy excess)
+precedes loss and history. Historical rank and risk are therefore strictly
+tie-break evidence rather than additive substitutes for a clear holdout win.
 
-The runner-up specification is always recorded. Its CPU checkpoint is retained
-only for a statistical tie. It is stored in a dormant plain Python bundle, so
-it is not a registered branch, does not change the returned model's parameter
-count or forward pass, and cannot act as an ensemble.
+The runner-up specification is always recorded. One CPU checkpoint is retained
+for either a statistical tie or as generalization insurance when the winner
+has a train/validation gap of at least 12 points or cross-entropy at least 8%
+above the uniform-class baseline. Risk insurance must be at least 25% smaller
+than the winner and within eight raw holdout percentage points. The checkpoint
+is stored in a dormant plain Python bundle, so it is not a registered branch,
+does not change the returned model's parameter count or forward pass, and
+cannot act as an ensemble.
 
 ## 7. Recipe and optimizer race
 
@@ -247,7 +276,8 @@ The ordered anytime queue is:
 1. continue the NAS-selected recipe and preserve its warm start;
 2. run every untried recipe/optimizer from the common NAS checkpoint with a
    new deterministic seed;
-3. when retained, train the tied second architecture as a single challenger;
+3. when retained, train the tied or efficient risk-insurance architecture as
+   one sequential challenger after the primary recipes are exhausted;
 4. restart from the immutable global-best model with progressively smaller
    learning rates and fresh seeds while another full epoch is safe;
 5. evaluate the current attempt's EMA and the top three same-architecture
@@ -304,8 +334,10 @@ The current regression suite covers:
   disjoint prior-preserving confirmation, and logical microbatch accumulation;
 - incumbent preservation, staged recipe fairness, loss/gap/confirmation
   objectives, uncertainty-aware acceptance, best-refinement restoration,
-  holdout-dominant ordering, promoted-family capacity strata, and
-  optimizer-state ownership;
+  holdout-dominant ordering, order-independent architecture seeds, reserved
+  anchor endpoints, bounded repechage, late-risk tie handling, efficient
+  challenger retention, promoted-family capacity strata, and optimizer-state
+  ownership;
 - SGD/Nesterov/cosine construction, no-rebound scheduling,
   incumbent-relative attempt rotation, incompatible-state rejection,
   EMA/state helpers, safe-flip TTA, and dormant challenger registration;

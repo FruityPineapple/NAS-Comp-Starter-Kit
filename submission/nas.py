@@ -55,6 +55,23 @@ class NAS:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
+    def _architecture_initialization_seed(self):
+        """Common initialization seed for every macro architecture.
+
+        Candidate position is deliberately absent. Reordering or inserting a
+        candidate must not silently change the stochastic trial assigned to an
+        existing architecture.
+        """
+        return self.seed + 500
+
+    def _architecture_round_seed(self, round_index):
+        """Common-random-number seed for a macro fidelity round."""
+        return self.seed + 1000 * (int(round_index) + 1)
+
+    def _architecture_refinement_seed(self, pass_index):
+        """Common-random-number seed for an equal-work refinement pass."""
+        return self.seed + 8000 + 101 * int(pass_index)
+
     @staticmethod
     def _sync(device):
         if device.type == "cuda":
@@ -985,7 +1002,7 @@ class NAS:
                 len(families), stage_steps
             )
         )
-        for index, family in enumerate(families):
+        for family in families:
             if self.clock.check() <= deadline_remaining + 10:
                 break
             entries = family_entries[family]
@@ -997,7 +1014,7 @@ class NAS:
                     item["params"],
                 ),
             )
-            self._seed_everything(self.seed + 1200 + index)
+            self._seed_everything(self.seed + 1200)
             model = self._attach_recipe(
                 space.build_model(entry["spec"]), recipe
             )
@@ -1014,6 +1031,10 @@ class NAS:
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
+            # Model constructors consume different numbers of random values.
+            # Reset once more so label-order, augmentation and dropout draws
+            # begin from a family-order-independent common seed.
+            self._seed_everything(self.seed + 1800)
             (
                 steps,
                 elapsed,
@@ -1108,10 +1129,10 @@ class NAS:
             0.40 * probe_budget / max(1, len(promoted)),
         )
         completed = []
-        for index, probe in enumerate(promoted):
+        for probe in promoted:
             if self.clock.check() <= deadline_remaining + 9:
                 break
-            self._seed_everything(self.seed + 2200 + index)
+            self._seed_everything(self.seed + 2200)
             (
                 steps,
                 elapsed,
@@ -1319,10 +1340,17 @@ class NAS:
         )
         return expanded
 
-    def _select_label_aware_entries(self, ranked, n_top):
+    def _select_label_aware_entries(
+        self,
+        ranked,
+        n_top,
+        anchor_specs_by_family=None,
+    ):
         """Allocate family quotas and parameter strata before proxy tie-breaks."""
         if not ranked or n_top <= 0:
             return []
+
+        anchor_specs_by_family = anchor_specs_by_family or {}
 
         family_order = []
         for entry in ranked:
@@ -1359,6 +1387,42 @@ class NAS:
             ]
             family_selected = 0
             quota = quotas[family]
+            # Reserve evenly spaced deterministic reference points before
+            # filling the remaining quota from size strata. With two slots,
+            # this keeps the compact and capacity endpoints; with three, it
+            # keeps compact, central, and capacity anchors. Missing or
+            # parameter-infeasible anchors consume no slot.
+            available_anchors = [
+                spec
+                for spec in anchor_specs_by_family.get(family, ())
+                if any(entry["spec"] == spec for entry in family_entries)
+            ]
+            if available_anchors:
+                anchor_slots = min(quota, len(available_anchors))
+                if anchor_slots == 1:
+                    anchor_indices = [len(available_anchors) // 2]
+                else:
+                    anchor_indices = [
+                        int(
+                            round(
+                                index
+                                * (len(available_anchors) - 1)
+                                / (anchor_slots - 1)
+                            )
+                        )
+                        for index in range(anchor_slots)
+                    ]
+                for anchor_index in dict.fromkeys(anchor_indices):
+                    anchor_spec = available_anchors[anchor_index]
+                    anchor_entry = next(
+                        entry
+                        for entry in family_entries
+                        if entry["spec"] == anchor_spec
+                    )
+                    before = len(selected)
+                    add(anchor_entry)
+                    family_selected += int(len(selected) > before)
+
             # Place deterministic targets uniformly in log-parameter space.
             # Proxy ranks only break equal-distance ties, so a cross-family
             # proxy bias cannot silently remove compact or wide capacity.
@@ -1382,6 +1446,8 @@ class NAS:
                 ]
             )
             for target_size in targets:
+                if family_selected >= quota:
+                    break
                 bucket = [
                     item
                     for item in sized
@@ -1838,6 +1904,16 @@ class NAS:
         uncertainty = math.sqrt(
             max(1e-8, accuracy * (1.0 - accuracy)) / samples
         )
+        # Absolute loss and train/validation separation are too noisy during
+        # the broad low-fidelity race. They become a small, bounded risk term
+        # only after a candidate has received at least two full-data
+        # refinement observations.
+        late_risk_penalty = 0.0
+        if len(entry.get("refinement_history", [])) >= 2:
+            late_risk_penalty = min(
+                0.006,
+                0.006 * self._architecture_risk(entry),
+            )
         return (
             0.88 * validation_score
             + 0.09 * consistency
@@ -1846,7 +1922,150 @@ class NAS:
             + min(0.002, 0.25 * uncertainty)
             - latency_penalty
             - epoch_penalty
+            - late_risk_penalty
         )
+
+    def _architecture_risk(self, entry):
+        """Return bounded late evidence of brittle generalization.
+
+        Accuracy remains the competition objective. This signal is used only
+        after meaningful fidelity, for uncertainty ties and for deciding
+        whether a materially smaller dormant challenger is worth retaining.
+        """
+        accuracy = float(
+            entry.get(
+                "confirmation_val_acc",
+                entry.get(
+                    "selection_val_acc",
+                    entry.get("val_acc", 0.0),
+                ),
+            )
+        )
+        train_accuracy = float(
+            entry.get("train_stats", {}).get("train_accuracy", accuracy)
+        )
+        gap = max(0.0, train_accuracy - accuracy)
+        loss = float(
+            entry.get(
+                "confirmation_val_loss",
+                entry.get(
+                    "selection_val_loss",
+                    entry.get("val_loss", float("nan")),
+                ),
+            )
+        )
+        chance_loss = math.log(max(2, int(getattr(self, "num_classes", 2))))
+        loss_excess = (
+            max(0.0, loss / max(1e-8, chance_loss) - 1.0)
+            if math.isfinite(loss)
+            else 0.0
+        )
+        ready = len(entry.get("refinement_history", [])) >= 2
+        risk = 0.0
+        if ready:
+            risk = (
+                0.65 * min(1.0, gap / 0.35)
+                + 0.35 * min(1.0, loss_excess / 0.50)
+            )
+        entry["train_validation_gap"] = gap
+        entry["absolute_loss_excess"] = loss_excess
+        entry["architecture_risk_ready"] = ready
+        entry["architecture_risk"] = risk
+        return risk
+
+    @staticmethod
+    def _candidate_accuracy(entry):
+        return float(
+            entry.get(
+                "confirmation_val_acc",
+                entry.get(
+                    "selection_val_acc",
+                    entry.get("val_acc", 0.0),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _recent_accuracy_gain(entry):
+        history = entry.get("val_history", [])
+        if len(history) < 2:
+            return 0.0
+        return max(0.0, float(history[-1]) - float(history[-2]))
+
+    def _anchor_insurance_allowance(self, entry):
+        """Bound how far a still-learning reference may trail the cutoff."""
+        accuracy = self._candidate_accuracy(entry)
+        samples = max(1, int(entry.get("val_samples", 1)))
+        uncertainty = math.sqrt(
+            max(1e-8, accuracy * (1.0 - accuracy)) / samples
+        )
+        return min(
+            0.08,
+            max(
+                0.025,
+                2.0 * self._recent_accuracy_gain(entry)
+                + 2.0 * uncertainty,
+            ),
+        )
+
+    def _select_halving_survivors(
+        self,
+        results,
+        survivor_count,
+        final_round=False,
+    ):
+        """Apply one bounded capacity-anchor repechage slot.
+
+        Earlier rounds replace the weakest normal survivor, so the scheduled
+        candidate count is unchanged. The last round may carry one eligible
+        reference into exactly two refinement passes, after which only the
+        best two continue.
+        """
+        if not results:
+            return [], None
+        keep = min(max(1, int(survivor_count)), len(results))
+        selected = list(results[:keep])
+        if keep < 2 or len(results) <= keep:
+            return selected, None
+
+        capacity_anchors = [
+            entry
+            for entry in results
+            if entry.get("anchor_kind") == "capacity"
+        ]
+        if not capacity_anchors:
+            return selected, None
+        reference = max(
+            capacity_anchors,
+            key=lambda item: (
+                float(item.get("utility", -float("inf"))),
+                self._candidate_accuracy(item),
+                -int(item.get("params", 0)),
+            ),
+        )
+        if any(reference is entry for entry in selected):
+            return selected, None
+        cutoff = selected[-1]
+        deficit = (
+            self._candidate_accuracy(cutoff)
+            - self._candidate_accuracy(reference)
+        )
+        if deficit > self._anchor_insurance_allowance(reference):
+            return selected, None
+
+        reference["anchor_insurance"] = True
+        reference["anchor_insurance_deficit"] = max(0.0, deficit)
+        if final_round:
+            selected.append(reference)
+        else:
+            selected[-1] = reference
+            selected.sort(
+                key=lambda item: float(
+                    item.get("utility", -float("inf"))
+                ),
+                reverse=True,
+            )
+        return selected, reference
 
     def _snapshot_refinement_checkpoint(self, candidate):
         """Capture a finalist state and the optimizer that produced it."""
@@ -1948,6 +2167,7 @@ class NAS:
         """Score final holdouts while retaining history only as a tie-break."""
         rank_scores = self._history_rank_scores(entries)
         for entry in entries:
+            self._architecture_risk(entry)
             entry["history_rank_score"] = rank_scores.get(id(entry), 0.5)
             if "confirmation_val_acc" in entry:
                 selection_accuracy = float(
@@ -2036,6 +2256,7 @@ class NAS:
         if len(overlapping) >= 2:
             overlapping.sort(
                 key=lambda item: (
+                    -float(item.get("architecture_risk", 0.0)),
                     -float(
                         item.get(
                             "confirmation_val_loss",
@@ -2056,6 +2277,51 @@ class NAS:
         )
         entries[:] = overlapping + clear_losers
         return entries, (max(thresholds) if thresholds else None)
+
+    def _select_retained_architecture_challenger(self, winner, entries):
+        """Choose a tied or efficient overfit-insurance checkpoint."""
+        alternatives = [entry for entry in entries if entry is not winner]
+        tied = [
+            entry
+            for entry in alternatives
+            if entry.get("uncertainty_tie", False)
+        ]
+        if winner.get("uncertainty_tie", False) and tied:
+            return tied[0], "uncertainty_tie"
+
+        self._architecture_risk(winner)
+        if not winner.get("architecture_risk_ready", False):
+            return None, None
+        # Either a large measured fit gap or cross-entropy materially worse
+        # than the uniform baseline is enough to justify one recovery option.
+        if (
+            float(winner.get("train_validation_gap", 0.0)) < 0.12
+            and float(winner.get("absolute_loss_excess", 0.0)) < 0.08
+        ):
+            return None, None
+
+        winner_params = max(1, int(winner.get("params", 0)))
+        winner_accuracy = self._candidate_accuracy(winner)
+        efficient = []
+        for entry in alternatives:
+            params = int(entry.get("params", winner_params))
+            if params <= 0 or params > 0.75 * winner_params:
+                continue
+            if self._candidate_accuracy(entry) < winner_accuracy - 0.08:
+                continue
+            self._architecture_risk(entry)
+            efficient.append(entry)
+        if not efficient:
+            return None, None
+        efficient.sort(
+            key=lambda item: (
+                self._candidate_accuracy(item),
+                -float(item.get("architecture_risk", 0.0)),
+                -int(item.get("params", 0)),
+            ),
+            reverse=True,
+        )
+        return efficient[0], "efficient_overfit_insurance"
 
     @staticmethod
     def _recipe_trial_score(trial):
@@ -2603,15 +2869,38 @@ class NAS:
         deadline_remaining,
         confirmation_batches=None,
     ):
-        finalists = self._select_label_aware_entries(ranked, n_top)
+        represented_families = list(
+            dict.fromkeys(
+                entry["spec"].model_family for entry in ranked
+            )
+        )
+        anchor_specs_by_family = {
+            family: self._anchor_specs(family, space)
+            for family in represented_families
+        }
+        finalists = self._select_label_aware_entries(
+            ranked,
+            n_top,
+            anchor_specs_by_family=anchor_specs_by_family,
+        )
+        anchor_kind_by_spec = {}
+        for family, specs in anchor_specs_by_family.items():
+            for kind, spec in zip(
+                ("compact", "central", "capacity"), specs
+            ):
+                anchor_kind_by_spec[spec] = kind
         architecture_recipe = self._architecture_search_recipe()
         active = []
-        for index, entry in enumerate(finalists):
+        initialization_seed = self._architecture_initialization_seed()
+        for entry in finalists:
             candidate = dict(entry)
-            self._seed_everything(self.seed + 500 + index)
+            self._seed_everything(initialization_seed)
             candidate["recipe"] = dict(architecture_recipe)
             candidate["model"] = self._attach_recipe(
                 space.build_model(entry["spec"]), architecture_recipe
+            )
+            candidate["anchor_kind"] = anchor_kind_by_spec.get(
+                entry["spec"]
             )
             candidate["trained_steps"] = 0
             candidate["train_seconds"] = 0.0
@@ -2655,11 +2944,7 @@ class NAS:
             for candidate_index, candidate in enumerate(active):
                 if self.clock.check() <= deadline_remaining + 6:
                     break
-                candidate_seed = (
-                    self.seed
-                    + 1000 * (round_index + 1)
-                    + candidate_index
-                )
+                candidate_seed = self._architecture_round_seed(round_index)
                 self._seed_everything(candidate_seed)
                 candidate["seed_schedule"].append(candidate_seed)
                 (
@@ -2755,11 +3040,31 @@ class NAS:
             results.sort(
                 key=lambda item: item["utility"], reverse=True
             )
-            keep = min(max(1, survivors), len(results))
-            for candidate in results[keep:]:
+            active, insured = self._select_halving_survivors(
+                results,
+                survivors,
+                final_round=(round_index == len(round_plan) - 1),
+            )
+            if insured is not None:
+                self.metadata["nas_anchor_insurance_uses"] = int(
+                    self.metadata.get("nas_anchor_insurance_uses", 0)
+                ) + 1
+                print(
+                    "  [NAS] Capacity-anchor insurance retained {} "
+                    "({:.2f}pp behind cutoff)".format(
+                        self._spec_label(insured["spec"]),
+                        float(
+                            insured.get("anchor_insurance_deficit", 0.0)
+                        )
+                        * 100,
+                    )
+                )
+            survivor_ids = {id(candidate) for candidate in active}
+            for candidate in results:
+                if id(candidate) in survivor_ids:
+                    continue
                 del candidate["model"]
                 candidate.pop("optimizer_state", None)
-            active = results[:keep]
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -2770,6 +3075,7 @@ class NAS:
             0.0, self.clock.check() - deadline_remaining - 12.0
         )
         refinement_loader = self._make_refinement_loader()
+        insurance_candidates = []
         if (
             len(active) >= 2
             and refinement_loader is not None
@@ -2828,7 +3134,7 @@ class NAS:
                     )
                 )
                 refined = []
-                for candidate_index, candidate in enumerate(active):
+                for candidate in active:
                     if self.clock.check() <= refinement_floor + 4:
                         break
                     seconds_per_step = max(
@@ -2837,11 +3143,8 @@ class NAS:
                     time_quantum = max(
                         5.0, 1.80 * seconds_per_step * common_steps
                     )
-                    candidate_seed = (
-                        self.seed
-                        + 8000
-                        + 101 * pass_index
-                        + candidate_index
+                    candidate_seed = self._architecture_refinement_seed(
+                        pass_index
                     )
                     self._seed_everything(candidate_seed)
                     candidate.setdefault("seed_schedule", []).append(
@@ -2929,6 +3232,36 @@ class NAS:
                     break
                 active = refined
                 pass_index += 1
+                # The final-round repechage buys exactly two equal full-data
+                # passes. Afterwards, the best two continue normally and the
+                # parked checkpoint remains available only for the final
+                # holdout comparison / dormant recovery path.
+                if pass_index >= 2 and len(active) > 2:
+                    active.sort(
+                        key=lambda item: float(
+                            item.get("utility", -float("inf"))
+                        ),
+                        reverse=True,
+                    )
+                    parked = active[2:]
+                    active = active[:2]
+                    for candidate in parked:
+                        best_checkpoint = candidate.pop(
+                            "_refinement_best_checkpoint", None
+                        )
+                        if best_checkpoint is not None:
+                            self._restore_refinement_checkpoint(
+                                candidate, best_checkpoint
+                            )
+                        candidate["anchor_insurance_parked"] = True
+                        insurance_candidates.append(candidate)
+                    self.metadata["nas_anchor_insurance_parked"] = int(
+                        len(insurance_candidates)
+                    )
+                    print(
+                        "    anchor insurance completed two passes; "
+                        "continuing the best two finalists"
+                    )
                 recent_gains = [
                     history[-1] - history[-2]
                     for history in (
@@ -2974,13 +3307,19 @@ class NAS:
         # The last challengers are measured on the same prior-preserving
         # selection source and, when available, an untouched confirmation
         # source. Earlier adaptive scores never masquerade as confirmation.
+        comparison_candidates = list(active)
+        comparison_ids = {id(candidate) for candidate in comparison_candidates}
+        for candidate in insurance_candidates:
+            if id(candidate) not in comparison_ids:
+                comparison_candidates.append(candidate)
+                comparison_ids.add(id(candidate))
         print(
             "  [NAS] Selection/confirmation champion comparison ({})".format(
-                len(active)
+                len(comparison_candidates)
             )
         )
         final_results = []
-        for candidate in active:
+        for candidate in comparison_candidates:
             if self.clock.check() <= deadline_remaining + 4 and final_results:
                 break
             candidate["model"].to(self.device)
@@ -3038,7 +3377,7 @@ class NAS:
                 )
             )
         if not final_results:
-            final_results = active
+            final_results = comparison_candidates
         final_results, tie_threshold = self._order_final_results(
             final_results
         )
@@ -3052,38 +3391,51 @@ class NAS:
                 )
             )
         winner = final_results[0]
-        challenger = final_results[1] if len(final_results) >= 2 else None
-        retained_challenger = None
-        if challenger is not None:
-            self.metadata["nas_challenger_spec"] = challenger["spec"]
-            self.metadata["nas_challenger_score"] = float(
-                challenger.get("selection_score", 0.0)
+        runner_up = final_results[1] if len(final_results) >= 2 else None
+        if runner_up is not None:
+            self.metadata["nas_runner_up_spec"] = runner_up["spec"]
+            self.metadata["nas_runner_up_score"] = float(
+                runner_up.get("selection_score", 0.0)
             )
-            # Retain the actual checkpoint only for an uncertainty tie. A
-            # clearly weaker architecture is not worth its memory footprint.
-            if (
-                winner.get("uncertainty_tie", False)
-                and challenger.get("uncertainty_tie", False)
-            ):
-                retained_challenger = challenger
-                self._attach_recipe(
-                    retained_challenger["model"], self._default_recipe()
+        (
+            retained_challenger,
+            challenger_reason,
+        ) = self._select_retained_architecture_challenger(
+            winner, final_results
+        )
+        if retained_challenger is not None:
+            self._attach_recipe(
+                retained_challenger["model"], self._default_recipe()
+            )
+            retained_challenger["model"].search_optimizer_state = (
+                copy.deepcopy(retained_challenger.get("optimizer_state"))
+            )
+            self.metadata["nas_challenger_spec"] = retained_challenger[
+                "spec"
+            ]
+            self.metadata["nas_challenger_score"] = float(
+                retained_challenger.get("selection_score", 0.0)
+            )
+            self.metadata["nas_challenger_retained"] = True
+            self.metadata["nas_challenger_reason"] = challenger_reason
+            self.metadata["nas_challenger_params"] = int(
+                retained_challenger.get("params", 0)
+            )
+            print(
+                "  [NAS] Retained dormant challenger {} ({})".format(
+                    self._spec_label(retained_challenger["spec"]),
+                    challenger_reason,
                 )
-                retained_challenger["model"].search_optimizer_state = (
-                    copy.deepcopy(
-                        retained_challenger.get("optimizer_state")
-                    )
-                )
-                self.metadata["nas_challenger_retained"] = True
-            else:
-                self.metadata["nas_challenger_retained"] = False
+            )
+        else:
+            self.metadata["nas_challenger_retained"] = False
         print(
             "  [NAS] Robust architecture score selected {} ({:.4f})".format(
                 self._spec_label(winner["spec"]),
                 winner.get("selection_score", 0.0),
             )
         )
-        for candidate in active:
+        for candidate in comparison_candidates:
             if (
                 candidate is not winner
                 and candidate is not retained_challenger
@@ -3111,6 +3463,11 @@ class NAS:
                         "confirmation_val_acc",
                         retained_challenger.get("val_acc", 0.0),
                     )
+                ),
+                "params": int(retained_challenger.get("params", 0)),
+                "reason": challenger_reason,
+                "risk": float(
+                    retained_challenger.get("architecture_risk", 0.0)
                 ),
             }
         return winner

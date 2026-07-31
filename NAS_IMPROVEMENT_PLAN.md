@@ -1,7 +1,8 @@
 # NAS Improvement Plan
 
-**Status:** All rule-neutral implementation work in Priorities 0-5 and the
-31 July controller-correction pass is complete and locally tested. Two
+**Status:** All rule-neutral implementation work in Priorities 0-5, the
+31 July controller-correction pass, and the post-run architecture-robustness
+pass is complete and locally tested. Two
 deliberately conditional experiments remain disabled: train-plus-validation
 refit pending broad historical ablation, and an ensemble pending explicit
 organizer confirmation. The corrected controller still requires a fresh
@@ -33,7 +34,8 @@ they describe the repository as it existed before implementation.
 - [x] Categorical/dense sequence, multi-view, volumetric, coordinate,
   spatial-axis, pre-activation grouped/wide, and dense feature-reuse anchors.
 - [x] Scalable Tier-1 search budget and a clock-driven final action queue
-  covering every recipe, a tied challenger, fresh-seed continuations, EMA,
+  covering every recipe, one tied/efficient challenger, fresh-seed
+  continuations, EMA,
   checkpoint averaging, and validated-flip TTA.
 - [x] Focused controller, objective, architecture, trainer, data, memory, and
   accelerated end-to-end regression tests.
@@ -57,6 +59,18 @@ they describe the repository as it existed before implementation.
   slow recoveries.
 - [x] Prevent SGD cosine decay from rebounding after its initial horizon and
   label scheduler diagnostics accurately.
+- [x] Remove candidate-list position from representation, macro-initialization,
+  fidelity-round, and refinement seeds; paired architectures now use common
+  deterministic seeds and data order at equal fidelity.
+- [x] Reserve feasible compact/central/capacity reference points inside family
+  quotas and give one still-learning capacity anchor a bounded late-fidelity
+  repechage.
+- [x] Use train-validation separation and absolute cross-entropy only as
+  bounded late-fidelity/tie risk evidence; they cannot overturn a clear
+  confirmation-accuracy winner.
+- [x] Retain one materially smaller architecture as a dormant sequential
+  challenger when the winner has strong overfit/brittleness evidence and the
+  smaller model is within eight raw percentage points of accuracy.
 - [ ] Run the original three and broader historical datasets with multiple
   seeds after the 31 July corrections; their arrays are not present locally.
 - [ ] Complete a successful real-CUDA peak-memory/OOM validation after the
@@ -80,6 +94,10 @@ the invalid-runtime failure log at:
 and the latest successful pre-correction run at:
 
 `C:\Users\Lennart\.codex\attachments\d2ca2821-4622-492f-b61d-bd7cac87de6d\pasted-text.txt`
+
+and the latest supplied post-correction run at:
+
+`C:\Users\Lennart\.codex\attachments\892d552c-77de-4c02-9e05-8b2206a898e9\pasted-text.txt`
 
 The middle log used the wrong runtime and is not evidence of a submission
 defect. Device-safe evaluation and OOM splitting remain useful defensive
@@ -135,14 +153,63 @@ assertion-based test entry points were used. PyTorch emitted existing AMP API
 deprecation warnings only. These checks establish regression safety, not
 post-correction dataset accuracy.
 
+### 0.2 Evidence-to-change map for the post-correction robustness pass
+
+The latest supplied run improved the total adjusted score to **6.628**, the
+best supplied total so far, but exposed a remaining architecture-selection
+failure on Gutenberg:
+
+| Dataset | Test accuracy | Adjusted score | Runtime |
+|---|---:|---:|---:|
+| AddNIST / Adaline | 95.710% | +5.773 | 1775.6s |
+| Gutenberg | 43.833% | +0.483 | 1776.5s |
+| Language / LaMelo | 85.750% | +0.372 | 1773.9s |
+
+The earlier controller corrections worked as intended: Gutenberg restored a
+42.30% search checkpoint, preserved the incumbent against a marginal SGD
+result, rotated failed recovery attempts, and reached 42.67% validation with
+EMA. The residual problem occurred earlier:
+
+| Weakness | Exact evidence | Implemented correction |
+|---|---|---|
+| Architecture and RNG trial were coupled to list position | The historical 47.667% `spatial S2 C64 B3 basic K3 SE0 stem3` model moved from candidate position 4 to position 12; the old code added candidate index to initialization, round, and refinement seeds | All architectures now receive a common initialization seed and a common seed per equal-work round/pass; representation probes follow the same rule |
+| A known-feasible slow starter could be eliminated before meaningful fidelity | The exact historical winner was present, scored 20.29% then 21.72%, ranked sixth after round 2, and was eliminated before the later full-data trajectory that had previously reached 47.667% test accuracy | Family quotas explicitly reserve feasible anchor endpoints; one capacity reference may replace the weakest survivor while within a learning/uncertainty allowance, then receive at most two extra full-data passes |
+| The selected architecture showed severe brittleness | The selected `spatial S4 C32 B2 basic K5 SE1 stem7` model had 7,701,478 parameters, selection cross-entropy 2.2761 (worse than `log(6)=1.792`), and reached 100% training accuracy by final-training epoch 14 while validation remained near 42% | Cross-entropy excess and train-validation gap are bounded late risk terms and tie-breakers; confirmation accuracy remains primary |
+| Only a statistically tied runner-up could reach Trainer | Recipe changes could not escape the selected Gutenberg architecture, even though a much smaller diverse architecture could generalize differently | When the winner is risky, retain at most one architecture with no more than 75% of its parameters and no more than an eight-point holdout deficit; Trainer tries it sequentially after distinct primary recipes, never as an ensemble |
+
+The repechage is generic and clock-bounded. It uses only architecture role,
+observed learning gain, sampling uncertainty, parameter count, validation
+accuracy/loss, and train accuracy. It does not inspect a dataset name. Earlier
+rounds keep their scheduled survivor count; only the last round may carry one
+extra reference, and that reference receives at most two equal full-data
+passes before the best two continue. A reference outside the bounded
+allowance receives no insurance.
+
+Local regression tests prove that reversing candidate order preserves an
+existing specification's initialization and round seed, feasible anchor
+endpoints survive quota construction, repechage is bounded, late risk acts
+only inside a confirmation tie, and a materially smaller checkpoint is
+retained only for a risky winner. These tests establish controller behavior;
+the three competition-style datasets still require a fresh rerun to measure
+the accuracy effect.
+
+Post-pass CPU verification completed bytecode compilation,
+`test_controller_refinements.py`, `test_search_objective.py`,
+`test_trainer_anytime.py`, `test_architecture_fixes.py`,
+`test_data_processor.py` (7/7), `test_memory_safety.py`, and the accelerated
+Tier-1 processing/search/training/prediction integration. The unaccelerated
+`test_full_pipeline.py` was started but is not counted as a pass: its long
+synthetic-clock training exceeded the 240-second command timeout without an
+assertion failure. Existing AMP deprecation warnings were the only warnings.
+
 ## 1. Executive summary
 
 The current submission is a safety-conscious hierarchical NAS portfolio. It
 profiles the input, activates several independent architecture families,
 pre-screens candidates with zero-cost proxies, compares a family-balanced set
-with label-based multi-fidelity training, refines two finalists, chooses a
-training recipe, and then continues training the selected model under a
-wall-clock guard.
+with label-based multi-fidelity training, refines the best two plus at most one
+bounded reference, chooses a training recipe, and then continues training the
+selected model under a wall-clock guard.
 
 The foundation is sound and should be retained:
 
@@ -167,7 +234,12 @@ proxies. Historical runs and the latest successful pre-correction run exposed:
 5. failed or exhausted final-training attempts monopolizing the clock;
 6. cosine SGD increasing its learning rate after the intended decay horizon.
 
-All six are now corrected in code and covered by focused regression tests. The
+The supplied 6.628 run then exposed four later architecture-selection issues:
+candidate-position-dependent seeds, premature elimination of a feasible slow
+starter, severe selected-model brittleness, and challenger retention limited
+to statistical ties.
+
+All ten are now corrected in code and covered by focused regression tests. The
 remaining gap is empirical rather than architectural: the corrected controller
 still needs multi-seed runs on the original three datasets, broader historical
 datasets, and a competition-compatible CUDA runtime.
@@ -359,8 +431,9 @@ The active final recipes are:
 - early rotation of failed recoveries and guarded rotation of late productive
   plateaus;
 - preference for regularized recipes after a strongly overfit failure;
-- optional statistically tied architecture challenger, fresh-seed
-  continuations, EMA, and same-architecture checkpoint averaging;
+- one optional statistically tied or materially smaller risk-insurance
+  architecture challenger, fresh-seed continuations, EMA, and
+  same-architecture checkpoint averaging;
 - recursive prediction-batch splitting after CUDA OOM;
 - restoration of the globally best checkpoint before prediction.
 
@@ -747,8 +820,9 @@ Changes:
    data coverage, seed, LR, time, and peak memory for every candidate.
 5. [x] Use the same stochastic seed schedule and data order for paired candidate
    comparisons.
-6. [x] Evaluate a fresh seed/continuation only for a statistically tied second
-   architecture.
+6. [x] Retain at most one alternate architecture: either a statistically tied
+   finalist or a materially smaller competitive model when the winner has
+   strong late brittleness evidence.
 7. [x] Convert normalization statistics to a byte-bounded streaming calculation.
 8. [x] Add byte caps to both train and validation caches.
 9. [x] Avoid whole-dataset dtype conversion.
@@ -850,6 +924,16 @@ Changes:
 11. [x] Restore the complete feasible macro pool after family promotion and
     choose within-family candidates across log-parameter strata, including a
     deterministic C64 anchor for full-grid families.
+12. [x] Remove candidate-index-dependent architecture seeds and use common
+    deterministic seeds for equal-work representation, fidelity, and
+    refinement comparisons.
+13. [x] Reserve feasible deterministic anchor endpoints inside family quotas.
+14. [x] Give one plausibly still-learning capacity anchor a bounded late
+    repechage without increasing earlier-round survivor counts.
+15. [x] Use train-validation gap and absolute cross-entropy as bounded late
+    risk/tie evidence, never as a substitute for a clear holdout win.
+16. [x] Preserve one materially smaller, sufficiently competitive architecture
+    as sequential overfit insurance when the winner is brittle.
 
 Expected benefit:
 
@@ -880,7 +964,8 @@ Changes:
    - [x] continue the best checkpoint with EMA;
    - [x] run every untried optimizer/recipe;
    - [x] run a new seed from the best checkpoint;
-   - [x] continue the second architecture finalist when statistically tied;
+   - [x] continue one dormant architecture when statistically tied or when a
+     materially smaller competitive model insures a brittle winner;
    - [x] try same-architecture checkpoint averaging;
    - [ ] optionally refit after locking the policy, pending broad ablation.
 4. [x] Keep the global best validation checkpoint immutable.
@@ -1078,8 +1163,8 @@ remains an empirical follow-up rather than enabled competition behavior.
 
 | File | Components | Planned responsibility |
 |---|---|---|
-| `submission/nas.py` | validation splitting/evaluation, `_expand_promoted_macro_pool`, `_select_label_aware_entries`, refinement checkpoint helpers, `_final_selection_scores`, `_order_final_results`, `_recipe_acceptance_margin`, `_recipe_tournament`, `_successive_halving`, `_search_pipeline`, time-tier configuration | Prior-preserving holdouts, full promoted-family capacity coverage, best refinement restoration, confirmation-dominant selection, uncertainty-aware incumbent replacement, scalable budgets, retained tied challenger |
-| `submission/trainer.py` | recipe application, optimizer/scheduler construction, `_step_scheduler`, `_apply_time_cooldown`, `_attempt_rotation_reason`, `_select_alternative_recipe`, `train`, `predict` | SGD/Nesterov, monotonic no-restart cosine, failed-attempt and late-plateau rotation, regularized fallback, EMA/checkpoint averaging, anytime action queue, measured prediction reserve, optional refit/TTA |
+| `submission/nas.py` | validation splitting/evaluation, common architecture seed helpers, `_expand_promoted_macro_pool`, `_select_label_aware_entries`, `_select_halving_survivors`, `_architecture_risk`, refinement checkpoint helpers, `_final_selection_scores`, `_order_final_results`, `_select_retained_architecture_challenger`, `_recipe_acceptance_margin`, `_recipe_tournament`, `_successive_halving`, `_search_pipeline`, time-tier configuration | Prior-preserving holdouts, full promoted-family capacity coverage, order-independent paired trials, bounded anchor insurance, best refinement restoration, confirmation-dominant selection, late brittleness evidence, uncertainty-aware incumbent replacement, scalable budgets, one dormant tied/efficient challenger |
+| `submission/trainer.py` | challenger handoff, recipe application, optimizer/scheduler construction, `_step_scheduler`, `_apply_time_cooldown`, `_attempt_rotation_reason`, `_select_alternative_recipe`, `train`, `predict` | Sequential tied/efficient architecture recovery, SGD/Nesterov, monotonic no-restart cosine, failed-attempt and late-plateau rotation, regularized fallback, EMA/checkpoint averaging, anytime action queue, measured prediction reserve, optional refit/TTA |
 | `submission/data_processor.py` | `NASDataset`, normalization statistics, augmentation construction, DataLoader construction | Lazy/per-batch dtype conversion, streaming byte-bounded statistics, searchable augmentation policies, safer large-data loading |
 | `submission/helpers.py` | `inspect_data_properties`, batch-size helper, possible new memory/time helpers | Richer axis/modality fingerprints, memory estimates, train-validation shift statistics |
 | `submission/search_space.py` | `ArchSpec`, blocks, model builders, analytical parameter counts | Token/embedding sequence, channel-independent, volumetric/temporal, position-sensitive, hybrid, WideResNet/ResNeXt/DenseNet-lite families |
@@ -1087,12 +1172,12 @@ remains an empirical follow-up rather than enabled competition behavior.
 | `submission/ensemble.py` | currently inactive | Optional only after rule confirmation; otherwise leave unused |
 | `submission/NAS_ARCHITECTURE.md` | active-controller section, pipeline, family and trainer descriptions | Must be updated in the same change as any implementation modification |
 | `submission/README.md` | runtime modes and feature summary | Update after behavior changes |
-| `test_controller_refinements.py` | controller unit/regression tests | Incumbent preservation, staged recipe promotion, uncertainty margins, best refinement restore, confirmation dominance, rank-only ties, promoted-family capacity coverage |
+| `test_controller_refinements.py` | controller unit/regression tests | Incumbent preservation, staged recipe promotion, uncertainty margins, order-independent architecture seeds, anchor reservation/repechage, best refinement restore, confirmation dominance, late-risk-only ties, efficient challenger retention, promoted-family capacity coverage |
 | `test_architecture_fixes.py` | search-space tests | New family activation, shapes, parameter counts, forward compatibility |
 | `test_data_processor.py` | data-processing tests | No full dtype copy, streaming stats, byte caps, augmentation policy behavior |
 | `test_full_pipeline.py` | end-to-end synthetic tiers | Full prediction count, short-budget fallbacks, no idle/crash behavior |
 | `test_memory_safety.py` | implemented | Large synthetic shapes/dtypes, cache-byte ceilings, logical microbatches |
-| `test_search_objective.py` | implemented | Prior-preserving validation, confirmation, confidence, loss/gap promotion |
+| `test_search_objective.py` | implemented | Prior-preserving validation, confirmation, confidence, loss/gap promotion, and common representation-stage seeds |
 | `test_trainer_anytime.py` | implemented | SGD/no-restart cosine, attempt-rotation guards, regularized priority, TTA, dormant challenger, clock-driven training |
 | `test_accelerated_pipeline.py` | implemented | Fast Tier-1 processing/search/training/prediction integration |
 
@@ -1115,6 +1200,10 @@ not bundle evaluation files, test data, or hidden-dataset logic.
 | Best refinement restoration | Prevents later search updates from erasing a better finalist | Extra CPU checkpoint memory | Optimizer and data-cursor state must match restored weights |
 | Confirmation-dominant final selection | Prevents adaptive history from overriding independent evidence | Small confirmation subsets can reorder true near-ties | Historical rank is permitted only inside the bounded tie band |
 | Full promoted-family size coverage | Recovers compact-to-wide capacity options | A weak size stratum consumes one finalist slot | Fixed label-candidate count and parameter/memory guards remain active |
+| Common architecture seeds | Removes candidate-order RNG confounding and makes paired comparisons reproducible | Correlated trials may favor a particular shared stochastic path | Hidden-data decisions still require multi-seed reruns; no candidate-specific seed tuning |
+| Bounded capacity-anchor insurance | Gives a slow-starting generic reference meaningful fidelity | Can spend two passes on a weak model | One slot, observed-gain/uncertainty gate, eight-point cap, clock reserve, and no codename logic |
+| Late architecture-risk evidence | Prefers a less brittle model inside a true holdout tie and identifies when recovery is warranted | Cross-entropy can be noisy while underfit | Activated only after refinement; cannot overturn a clear confirmation winner |
+| Efficient dormant challenger | Offers a different generalization path after primary recipes fail | Extra CPU memory and final-training time | At most one, at least 25% smaller, within eight accuracy points, trained sequentially, never ensembled |
 | Minimum meaningful architecture fidelity | Lower selection regret | Fewer candidates evaluated | Remain dataset-agnostic |
 | Scalable anytime controller | Uses otherwise wasted compute and long Phase 3 budgets | More validation adaptivity | Hard external clock checks remain mandatory |
 | Guarded attempt rotation | Redirects time from failed/overfit attempts | A very slow recovery may be interrupted | Immutable global best and minimum-runway conditions remain active |
@@ -1319,18 +1408,18 @@ A new session should not have to rediscover the following:
    Use the first "active controller" section of
    `submission/NAS_ARCHITECTURE.md`; later historical material is retained only
    to explain how the design evolved.
-2. **The latest successful pre-correction score is 4.233 adjusted points:**
-   AddNIST `+3.379` at 93.280%, Gutenberg `+0.164` at 41.950%, and Language
-   `+0.689` at 86.220%. The older 5.135 result is a separate historical
-   baseline, not the current result.
+2. **The latest supplied score is 6.628 adjusted points:** AddNIST `+5.773`
+   at 95.710%, Gutenberg `+0.483` at 43.833%, and Language `+0.372` at
+   85.750%. The immediate pre-correction run scored 4.233; the older 5.135
+   result remains a separate historical baseline.
 3. **Those runs used the evaluator's 30-minute default** because all three
    metadata files lacked `time_limit`.
 4. **The three-dataset failure log used the wrong runtime.** It is not evidence
    that the submission was broken. Device-safe evaluation, OOM splitting, and
    malformed-family containment remain worthwhile defensive invariants.
-5. **The latest successful run returned worse refinement endpoints for several
-   finalists.** Current code restores the best matching model, optimizer,
-   step, and data-cursor state before holdout comparison.
+5. **The 4.233 pre-correction run returned worse refinement endpoints for
+   several finalists.** Current code restores the best matching model,
+   optimizer, step, and data-cursor state before holdout comparison.
 6. **Historical rank selected the clearly worse AddNIST finalist.** Current
    code makes confirmation accuracy dominant; loss, combined holdout score,
    and rank can act only inside a bounded confirmation uncertainty band.
@@ -1342,7 +1431,7 @@ A new session should not have to rediscover the following:
    Current code restores the full feasible macro pool for promoted families,
    uses compact-to-wide parameter strata, and includes a C64 anchor for
    full-grid families.
-9. **Final-training allocation was pathological on the latest run.** Current
+9. **Final-training allocation was pathological on the 4.233 run.** Current
    code distinguishes a failed overfit recovery from a productive slow
    recovery, rotates the former early, and rotates the latter only after a
    guarded late plateau.
@@ -1362,10 +1451,12 @@ A new session should not have to rediscover the following:
     unproven after the correction.** The latest inputs were only 24-28 pixels
     per side; run a competition-compatible CUDA/OOM stress test before
     submission.
-15. **No post-correction accuracy claim is justified yet.** The next empirical
-    task is a paired, multi-seed rerun on the original three and broader
-    historical datasets, recording raw accuracy, selection regret, runtime,
-    peak memory, and failure rate.
+15. **No post-robustness-pass accuracy claim is justified yet.** The 6.628 run
+    predates common architecture seeds, anchor insurance, late risk evidence,
+    and efficient challenger retention. The next empirical task is a paired,
+    multi-seed rerun on the original three and broader historical datasets,
+    recording raw accuracy, selection regret, runtime, peak memory, and
+    failure rate.
 16. **The default `C:\Python314` environment lacks PyTorch and pytest.**
     `C:\Users\Lennart\miniconda3\python.exe` contains CPU PyTorch and runs the
     executable regression scripts; CUDA and historical arrays require Colab or
@@ -1379,6 +1470,23 @@ A new session should not have to rediscover the following:
     and do not enable `submission/ensemble.py` without organizer confirmation.
 19. **Before any future edit, recheck `git status` and preserve unrelated user
     changes.**
+20. **The remaining Gutenberg regression was an early architecture-selection
+    failure.** The exact older 47.667% architecture was in the race but was
+    eliminated after 20.29% and 21.72% low-fidelity results; changing final
+    recipes alone could not recover it.
+21. **Candidate order must never choose an architecture's stochastic trial.**
+    Representation probes, model initialization, fidelity rounds, and
+    refinement passes now use common deterministic paired seeds. Reordering
+    and insertion behavior is regression-tested.
+22. **Anchor insurance is bounded evidence gathering, not hard routing.** One
+    capacity reference can survive only while its deficit is supported by
+    uncertainty or recent gain, and it receives at most two insured full-data
+    passes before it must rank in the top two on merit. A clear confirmation
+    winner remains decisive.
+23. **The efficient challenger is sequential, not an ensemble.** At most one
+    materially smaller checkpoint is kept when the winner is demonstrably
+    brittle. It is tried only after the primary architecture's distinct
+    recipes and never participates in the same forward pass.
 
 ## 12. Reference links
 
