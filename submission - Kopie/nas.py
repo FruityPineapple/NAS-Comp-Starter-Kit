@@ -966,19 +966,7 @@ class NAS:
             model = self._attach_recipe(
                 space.build_model(entry["spec"]), recipe
             )
-            try:
-                initial = self._evaluate(model, validation_batches)
-            except (RuntimeError, ValueError) as error:
-                print(
-                    "    {} probe skipped before training: {}".format(
-                        family, str(error).splitlines()[0]
-                    )
-                )
-                model.cpu()
-                del model
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                continue
+            initial = self._evaluate(model, validation_batches)
             (
                 steps,
                 elapsed,
@@ -1023,19 +1011,9 @@ class NAS:
             )
 
         if len(probes) < 2:
-            successful_families = {
-                probe["family"] for probe in probes
-            }
             for probe in probes:
                 del probe["model"]
-            if successful_families:
-                return successful_families
-            safe_families = {
-                family
-                for family in families
-                if family in {"spatial", "spatial_pyramid", "factorized"}
-            }
-            return safe_families or set(families)
+            return set(families)
         probes.sort(key=lambda item: item["probe_score"], reverse=True)
         promoted = probes[:2]
         if len(probes) >= 3:
@@ -1095,20 +1073,7 @@ class NAS:
             )
             if failed or steps == 0:
                 continue
-            try:
-                metrics = self._evaluate(
-                    probe["model"], validation_batches
-                )
-            except (RuntimeError, ValueError) as error:
-                print(
-                    "    promoted {} evaluation skipped: {}".format(
-                        probe["family"], str(error).splitlines()[0]
-                    )
-                )
-                probe["model"].cpu()
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                continue
+            metrics = self._evaluate(probe["model"], validation_batches)
             probe["optimizer_state"] = optimizer_state
             probe["steps"] += steps
             probe["elapsed"] += elapsed
@@ -1598,42 +1563,6 @@ class NAS:
             train_stats,
         )
 
-    def _evaluation_logits(self, model, data):
-        """Forward an evaluation batch with ordered recursive OOM splitting."""
-        cpu_data = data.detach().cpu()
-        try:
-            device_data = cpu_data.to(
-                self.device, non_blocking=self.device.type == "cuda"
-            )
-            with torch.no_grad(), torch.cuda.amp.autocast(
-                enabled=self.device.type == "cuda"
-            ):
-                return model(device_data).float().cpu()
-        except RuntimeError as error:
-            if not self._is_oom(error) or cpu_data.size(0) <= 1:
-                raise
-            if "device_data" in locals():
-                del device_data
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-            midpoint = cpu_data.size(0) // 2
-            self.metadata["nas_evaluation_microbatch_size"] = min(
-                int(
-                    self.metadata.get(
-                        "nas_evaluation_microbatch_size",
-                        cpu_data.size(0),
-                    )
-                ),
-                max(midpoint, cpu_data.size(0) - midpoint),
-            )
-            return torch.cat(
-                [
-                    self._evaluation_logits(model, cpu_data[:midpoint]),
-                    self._evaluation_logits(model, cpu_data[midpoint:]),
-                ],
-                dim=0,
-            )
-
     def _evaluate(self, model, source=None):
         source = source if source is not None else self.valid_loader
         # Evaluation is a public controller boundary and must not depend on
@@ -1651,8 +1580,16 @@ class NAS:
         class_total = torch.zeros(self.num_classes, dtype=torch.long)
         with torch.no_grad():
             for data, target in source:
-                output = self._evaluation_logits(model, data)
-                target = target.detach().cpu().long()
+                data = data.to(
+                    self.device, non_blocking=self.device.type == "cuda"
+                )
+                target = target.to(
+                    self.device, non_blocking=self.device.type == "cuda"
+                )
+                with torch.cuda.amp.autocast(
+                    enabled=self.device.type == "cuda"
+                ):
+                    output = model(data)
                 total_loss += float(
                     F.cross_entropy(
                         output.float(), target, reduction="sum"
@@ -1671,8 +1608,8 @@ class NAS:
                 matches = predictions == target
                 correct += int(matches.sum().item())
                 total += target.size(0)
-                cpu_target = target
-                cpu_matches = matches.long()
+                cpu_target = target.detach().cpu()
+                cpu_matches = matches.detach().cpu().long()
                 class_total += torch.bincount(
                     cpu_target, minlength=self.num_classes
                 )

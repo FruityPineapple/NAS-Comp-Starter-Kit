@@ -37,10 +37,17 @@ they describe the repository as it existed before implementation.
   checkpoint averaging, and validated-flip TTA.
 - [x] Focused memory, objective, architecture, trainer, and accelerated
   end-to-end regression tests.
+- [x] Fix the CUDA representation-probe regression exposed by the first
+  post-implementation three-dataset run: every controller evaluation now
+  places a fresh or CPU-parked model on the controller device before the
+  forward pass.
+- [x] Make controller validation recursively split an oversized batch after
+  CUDA OOM while preserving sample order, and contain a malformed
+  representation family instead of aborting the entire dataset.
 - [ ] Run the original three and broader historical datasets with multiple
-  seeds; their arrays are not present locally.
-- [ ] Run real CUDA peak-memory/OOM validation; the local PyTorch runtime is
-  CPU-only.
+  seeds after the CUDA fix; their arrays are not present locally.
+- [ ] Complete a successful real-CUDA peak-memory/OOM validation after the
+  fix; the local PyTorch runtime is CPU-only.
 - [ ] Enable train-plus-validation refit only if leave-one-dataset-out
   ablation shows a general benefit.
 - [ ] Enable a complementary-model ensemble only after organizer confirmation.
@@ -48,10 +55,23 @@ they describe the repository as it existed before implementation.
 The exact active architecture is documented in
 `submission/NAS_ARCHITECTURE.md`.
 
-**Primary evidence:** The current repository, the competition evaluator, and
-the latest three-dataset run log at:
+**Primary evidence:** The current repository, the competition evaluator, the
+original successful three-dataset run log at:
 
 `C:\Users\Lennart\.codex\attachments\4a0d3e89-fc84-49a2-802e-4255e45f0318\pasted-text.txt`
+
+and the post-implementation CUDA failure log at:
+
+`C:\Users\Lennart\.codex\attachments\548f438a-769b-4a6f-9a48-37f91aefaa3c\pasted-text.txt`
+
+The latter failed identically on Adaline, Gutenberg, and LaMelo before any
+family-probe training. `_representation_probe_race()` constructed a model on
+CPU and immediately called `_evaluate()`, while `_evaluate()` moved only its
+input to CUDA. AMP therefore supplied a CUDA half-precision input to CPU
+float32 convolution weights. The device-safe evaluation boundary described
+above directly fixes that common traceback. The scorer's later NumPy `int64`
+JSON-serialization message occurred only after all dataset executions had
+already failed and is not the causal submission error.
 
 ## 1. Executive summary
 

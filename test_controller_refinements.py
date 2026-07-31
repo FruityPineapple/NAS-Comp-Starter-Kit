@@ -404,6 +404,71 @@ def test_controller_evaluation_reports_cross_entropy_loss():
     assert metrics["samples"] == 2
 
 
+def test_controller_evaluation_places_fresh_model_on_controller_device():
+    controller = object.__new__(NAS)
+    controller.device = torch.device("cpu")
+    controller.num_classes = 2
+    model = torch.nn.Linear(3, 2)
+    observed_devices = []
+    placement_calls = []
+
+    class _DeviceRecorder(torch.nn.Module):
+        def __init__(self, wrapped):
+            super().__init__()
+            self.wrapped = wrapped
+
+        def to(self, *args, **kwargs):
+            placement_calls.append(str(args[0]))
+            return super().to(*args, **kwargs)
+
+        def forward(self, data):
+            observed_devices.append(
+                (
+                    data.device.type,
+                    next(self.parameters()).device.type,
+                )
+            )
+            return self.wrapped(data)
+
+    recorded_model = _DeviceRecorder(model)
+    controller._evaluate(
+        recorded_model,
+        [(torch.randn(4, 3), torch.tensor([0, 1, 0, 1]))],
+    )
+    assert placement_calls == ["cpu"]
+    assert observed_devices == [("cpu", "cpu")]
+
+
+def test_controller_evaluation_splits_oom_batches_in_order():
+    controller = object.__new__(NAS)
+    controller.device = torch.device("cpu")
+    controller.num_classes = 2
+    controller.metadata = {}
+
+    class _LimitedBatchModel(torch.nn.Module):
+        def forward(self, data):
+            if data.size(0) > 2:
+                raise RuntimeError("out of memory")
+            return data
+
+    logits = torch.tensor(
+        [
+            [3.0, 0.0],
+            [0.0, 3.0],
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [4.0, 0.0],
+        ]
+    )
+    targets = torch.tensor([0, 1, 0, 1, 0])
+    metrics = controller._evaluate(
+        _LimitedBatchModel(), [(logits, targets)]
+    )
+    assert metrics["accuracy"] == 1.0
+    assert metrics["samples"] == 5
+    assert controller.metadata["nas_evaluation_microbatch_size"] <= 2
+
+
 def test_recipe_race_short_budget_falls_back_without_training():
     result, calls, _, _ = _run_recipe_race(
         {
@@ -428,5 +493,7 @@ if __name__ == "__main__":
     test_recipe_race_restores_best_stage_and_matching_optimizer()
     test_recipe_trial_score_uses_validation_loss_slope()
     test_controller_evaluation_reports_cross_entropy_loss()
+    test_controller_evaluation_places_fresh_model_on_controller_device()
+    test_controller_evaluation_splits_oom_batches_in_order()
     test_recipe_race_short_budget_falls_back_without_training()
     print("Controller refinement regression tests passed")

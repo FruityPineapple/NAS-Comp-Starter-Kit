@@ -154,11 +154,6 @@ a second equal segment on new data positions.
 
 Only macro candidates from promoted families enter successive halving. If the
 clock or evidence is insufficient, all represented families remain eligible.
-Every controller evaluation first places its model on the controller device;
-this includes newly constructed probes and probes parked on CPU between
-stages. A runtime-invalid family is skipped locally. If fewer than two probes
-remain, successful families are retained; if none remain, the conservative
-spatial/factorized family set is restored rather than aborting the dataset.
 
 ### 6.4 Macro architecture race
 
@@ -247,14 +242,8 @@ original logits and only the verified horizontal/vertical views.
 ## 9. Failure behavior
 
 - Search and validation materialization are byte bounded.
-- Controller evaluation is a device-safe boundary: the model is moved before
-  inputs, including for fresh representation probes on CUDA.
-- Validation CUDA OOM recursively splits the current batch, concatenates CPU
-  logits in original order, and leaves metric accumulation on CPU.
 - CUDA search OOM halves the microbatch and retries the same logical batch.
 - A candidate is rejected only if a one-example microbatch still fails.
-- A failed representation-family evaluation is contained to that family and
-  cannot by itself terminate the dataset.
 - Calibration OOM rebuilds final loaders at half batch size.
 - In-epoch OOM preserves the global best and can reduce the loader.
 - Prediction OOM recursively splits a batch while preserving order.
