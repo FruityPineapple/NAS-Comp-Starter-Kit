@@ -73,6 +73,13 @@ class NAS:
             if parameter.requires_grad
         )
 
+    @staticmethod
+    def _cpu_model_state(model):
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+
     def search(self):
         tier = get_tier(self.clock)
         remaining = self.clock.check()
@@ -271,16 +278,40 @@ class NAS:
             3,
             family,
         )
-        capacity = ArchSpec(
-            min(3, space.max_safe_stages),
-            32,
-            2,
-            "basic",
-            5,
-            family in ("spatial", "spatial_pyramid", "axis_width", "axis_height"),
-            3,
-            family,
-        )
+        full_grid_family = family in {
+            "spatial",
+            "spatial_pyramid",
+            "factorized",
+            "axis_width",
+            "axis_height",
+            "dual_axis",
+        }
+        if full_grid_family:
+            # Use a genuinely distinct wide anchor when the parameter guard
+            # permits it. The former nominal capacity anchor was another C32
+            # model and could leave an entire promoted family without a C64
+            # label-trained candidate.
+            capacity = ArchSpec(
+                min(2, space.max_safe_stages),
+                64,
+                3,
+                "basic",
+                3,
+                False,
+                3,
+                family,
+            )
+        else:
+            capacity = ArchSpec(
+                min(3, space.max_safe_stages),
+                32,
+                2,
+                "bottleneck",
+                5,
+                True,
+                5,
+                family,
+            )
         return list(dict.fromkeys((compact, central, capacity)))
 
     @staticmethod
@@ -859,7 +890,11 @@ class NAS:
                 -result["loss"],
             ),
         )
-        margin = self._recipe_acceptance_margin(incumbent["samples"])
+        margin = self._recipe_acceptance_margin(
+            incumbent["samples"],
+            incumbent["accuracy"],
+            best["accuracy"],
+        )
         accuracy_gain = best["accuracy"] - incumbent["accuracy"]
         relative_loss_gain = (
             incumbent["loss"] - best["loss"]
@@ -1237,6 +1272,53 @@ class NAS:
             entry["proxy_prior"] = 1.0 - proxy_rank / max(1, len(ranked) - 1)
         return ranked
 
+    def _expand_promoted_macro_pool(self, ranked, pool, promoted_families):
+        """Restore full size coverage after the representation race."""
+        promoted_families = set(promoted_families)
+        expanded = [
+            entry
+            for entry in ranked
+            if entry["spec"].model_family in promoted_families
+        ]
+        seen = {entry["spec"] for entry in expanded}
+        for spec, params in sorted(
+            pool,
+            key=lambda item: (
+                item[0].model_family,
+                int(item[1]),
+                tuple(item[0]),
+            ),
+        ):
+            if (
+                spec.model_family not in promoted_families
+                or spec in seen
+            ):
+                continue
+            expanded.append(
+                {
+                    "spec": spec,
+                    "params": int(params),
+                    "scores": {},
+                    "proxy_prior": 0.0,
+                    "proxy_evaluated": False,
+                }
+            )
+            seen.add(spec)
+
+        counts = {
+            family: sum(
+                entry["spec"].model_family == family
+                for entry in expanded
+            )
+            for family in sorted(promoted_families)
+        }
+        self.metadata["nas_promoted_macro_pool_size"] = int(len(expanded))
+        print(
+            "  [NAS] Promoted macro pool restored from full feasible "
+            "size strata: {}".format(counts)
+        )
+        return expanded
+
     def _select_label_aware_entries(self, ranked, n_top):
         """Allocate family quotas and parameter strata before proxy tie-breaks."""
         if not ranked or n_top <= 0:
@@ -1257,6 +1339,11 @@ class NAS:
         }
         selected = []
         keys = set()
+        proxy_order = {
+            entry["spec"]: index
+            for index, entry in enumerate(ranked)
+            if entry.get("proxy_evaluated", True)
+        }
 
         def add(entry):
             key = entry["spec"]
@@ -1272,8 +1359,9 @@ class NAS:
             ]
             family_selected = 0
             quota = quotas[family]
-            # Proxy ranks only break ties inside size strata. This prevents an
-            # unreliable proxy from selecting several near-identical models.
+            # Place deterministic targets uniformly in log-parameter space.
+            # Proxy ranks only break equal-distance ties, so a cross-family
+            # proxy bias cannot silently remove compact or wide capacity.
             sized = sorted(
                 family_entries,
                 key=lambda item: (
@@ -1282,20 +1370,37 @@ class NAS:
                     item["spec"].num_stages,
                 ),
             )
-            for stratum in range(quota):
-                start = stratum * len(sized) // quota
-                end = max(start + 1, (stratum + 1) * len(sized) // quota)
-                bucket_specs = {
-                    item["spec"] for item in sized[start:end]
-                }
-                entry = next(
-                    (
-                        item
-                        for item in family_entries
-                        if item["spec"] in bucket_specs
-                        and item["spec"] not in keys
+            log_min = math.log1p(max(0, int(sized[0].get("params", 0))))
+            log_max = math.log1p(max(0, int(sized[-1].get("params", 0))))
+            targets = (
+                [(log_min + log_max) / 2.0]
+                if quota == 1
+                else [
+                    log_min
+                    + (log_max - log_min) * stratum / max(1, quota - 1)
+                    for stratum in range(quota)
+                ]
+            )
+            for target_size in targets:
+                bucket = [
+                    item
+                    for item in sized
+                    if item["spec"] not in keys
+                ]
+                if not bucket:
+                    continue
+                entry = min(
+                    bucket,
+                    key=lambda item: (
+                        abs(
+                            math.log1p(
+                                max(0, int(item.get("params", 0)))
+                            )
+                            - target_size
+                        ),
+                        proxy_order.get(item["spec"], len(ranked)),
+                        tuple(item["spec"]),
                     ),
-                    None,
                 )
                 if entry is not None:
                     add(entry)
@@ -1743,6 +1848,59 @@ class NAS:
             - epoch_penalty
         )
 
+    def _snapshot_refinement_checkpoint(self, candidate):
+        """Capture a finalist state and the optimizer that produced it."""
+        return {
+            "model_state": self._cpu_model_state(candidate["model"]),
+            "optimizer_state": copy.deepcopy(
+                candidate.get("optimizer_state")
+            ),
+            "val_acc": float(candidate.get("val_acc", 0.0)),
+            "balanced_acc": float(
+                candidate.get(
+                    "balanced_acc",
+                    candidate.get("val_acc", 0.0),
+                )
+            ),
+            "val_loss": float(candidate.get("val_loss", float("inf"))),
+            "val_margin": float(candidate.get("val_margin", 0.0)),
+            "val_samples": int(candidate.get("val_samples", 0)),
+            "trained_steps": int(candidate.get("trained_steps", 0)),
+            "data_cursor": int(candidate.get("data_cursor", 0)),
+            "train_stats": copy.deepcopy(candidate.get("train_stats", {})),
+        }
+
+    @staticmethod
+    def _is_better_refinement_checkpoint(candidate, checkpoint):
+        accuracy = float(candidate.get("val_acc", 0.0))
+        loss = float(candidate.get("val_loss", float("inf")))
+        best_accuracy = float(checkpoint.get("val_acc", 0.0))
+        best_loss = float(checkpoint.get("val_loss", float("inf")))
+        return accuracy > best_accuracy + 1e-12 or (
+            abs(accuracy - best_accuracy) <= 1e-12
+            and loss < best_loss
+        )
+
+    @staticmethod
+    def _restore_refinement_checkpoint(candidate, checkpoint):
+        candidate["model"].load_state_dict(checkpoint["model_state"])
+        candidate["optimizer_state"] = copy.deepcopy(
+            checkpoint.get("optimizer_state")
+        )
+        for name in (
+            "val_acc",
+            "balanced_acc",
+            "val_loss",
+            "val_margin",
+            "val_samples",
+            "trained_steps",
+            "data_cursor",
+        ):
+            candidate[name] = checkpoint[name]
+        candidate["train_stats"] = copy.deepcopy(
+            checkpoint.get("train_stats", {})
+        )
+
     @staticmethod
     def _adapt_search_lr(entry):
         """Small plateau schedule while retaining AdamW moments across rounds."""
@@ -1787,9 +1945,10 @@ class NAS:
         }
 
     def _final_selection_scores(self, entries):
-        """Blend final accuracy, preceding fidelity and rank consistency."""
+        """Score final holdouts while retaining history only as a tie-break."""
         rank_scores = self._history_rank_scores(entries)
         for entry in entries:
+            entry["history_rank_score"] = rank_scores.get(id(entry), 0.5)
             if "confirmation_val_acc" in entry:
                 selection_accuracy = float(
                     entry.get(
@@ -1802,21 +1961,101 @@ class NAS:
                 )
                 entry["selection_score"] = (
                     0.80 * confirmation_accuracy
-                    + 0.15 * selection_accuracy
-                    + 0.05 * rank_scores.get(id(entry), 0.5)
+                    + 0.20 * selection_accuracy
                 )
                 continue
             full_score = float(
                 entry.get("full_val_acc", entry.get("val_acc", 0.0))
             )
-            history = entry.get("val_history", [])
-            preceding = float(history[-1]) if history else full_score
-            entry["selection_score"] = (
-                0.65 * full_score
-                + 0.25 * preceding
-                + 0.10 * rank_scores.get(id(entry), 0.5)
-            )
+            entry["selection_score"] = full_score
         return entries
+
+    @staticmethod
+    def _confirmation_tie_threshold(first, second):
+        """Return a bounded uncertainty band for two holdout accuracies."""
+        samples = max(
+            1,
+            min(
+                int(first.get("confirmation_samples", 1)),
+                int(second.get("confirmation_samples", 1)),
+            ),
+        )
+        first_accuracy = float(first["confirmation_val_acc"])
+        second_accuracy = float(second["confirmation_val_acc"])
+        pooled_se = math.sqrt(
+            (
+                first_accuracy * (1.0 - first_accuracy)
+                + second_accuracy * (1.0 - second_accuracy)
+            )
+            / samples
+        )
+        return max(1.0 / samples, min(0.01, 0.75 * pooled_se))
+
+    def _order_final_results(self, entries):
+        """Order finalists with confirmation dominance and tie-only history."""
+        self._final_selection_scores(entries)
+        if not entries:
+            return entries, None
+        if not all("confirmation_val_acc" in entry for entry in entries):
+            entries.sort(
+                key=lambda item: (
+                    item.get("selection_score", -float("inf")),
+                    -float(item.get("selection_val_loss", float("inf"))),
+                    item.get("history_rank_score", 0.5),
+                ),
+                reverse=True,
+            )
+            return entries, None
+
+        # Confirmation accuracy is the independent decision source. Only
+        # candidates inside its bounded uncertainty band may use loss,
+        # selection accuracy, or historical rank as tie-breaks.
+        entries.sort(
+            key=lambda item: (
+                float(item["confirmation_val_acc"]),
+                float(item.get("selection_val_acc", 0.0)),
+            ),
+            reverse=True,
+        )
+        leader = entries[0]
+        overlapping = [leader]
+        clear_losers = []
+        thresholds = []
+        for entry in entries[1:]:
+            threshold = self._confirmation_tie_threshold(leader, entry)
+            if (
+                float(leader["confirmation_val_acc"])
+                - float(entry["confirmation_val_acc"])
+                <= threshold
+            ):
+                overlapping.append(entry)
+                thresholds.append(threshold)
+            else:
+                clear_losers.append(entry)
+
+        if len(overlapping) >= 2:
+            overlapping.sort(
+                key=lambda item: (
+                    -float(
+                        item.get(
+                            "confirmation_val_loss",
+                            float("inf"),
+                        )
+                    ),
+                    item.get("selection_score", -float("inf")),
+                    item.get("history_rank_score", 0.5),
+                ),
+                reverse=True,
+            )
+        clear_losers.sort(
+            key=lambda item: (
+                float(item["confirmation_val_acc"]),
+                item.get("selection_score", -float("inf")),
+            ),
+            reverse=True,
+        )
+        entries[:] = overlapping + clear_losers
+        return entries, (max(thresholds) if thresholds else None)
 
     @staticmethod
     def _recipe_trial_score(trial):
@@ -1854,15 +2093,42 @@ class NAS:
         trial["selection_score"] = score
         return score
 
-    def _recipe_acceptance_margin(self, samples):
-        """Require at least one validation example and a 0.10pp floor."""
+    def _recipe_acceptance_margin(
+        self,
+        samples,
+        incumbent_accuracy=None,
+        challenger_accuracy=None,
+    ):
+        """Return a bounded uncertainty-aware replacement margin."""
         configured_floor = float(
             getattr(self, "recipe_min_accuracy_gain", 0.001)
         )
+        samples = max(1, int(samples))
+        uncertainty_margin = 0.0
+        if (
+            incumbent_accuracy is not None
+            and challenger_accuracy is not None
+        ):
+            incumbent_accuracy = min(
+                1.0, max(0.0, float(incumbent_accuracy))
+            )
+            challenger_accuracy = min(
+                1.0, max(0.0, float(challenger_accuracy))
+            )
+            pooled_se = math.sqrt(
+                (
+                    incumbent_accuracy * (1.0 - incumbent_accuracy)
+                    + challenger_accuracy
+                    * (1.0 - challenger_accuracy)
+                )
+                / samples
+            )
+            uncertainty_margin = min(0.01, 0.75 * pooled_se)
         return max(
             0.0,
             configured_floor,
-            1.0 / max(1, int(samples)),
+            1.0 / samples,
+            uncertainty_margin,
         )
 
     def _recipe_tournament(
@@ -1899,7 +2165,9 @@ class NAS:
         )
         incumbent_samples = int(incumbent_metrics.get("samples", 0))
         acceptance_margin = self._recipe_acceptance_margin(
-            incumbent_samples
+            incumbent_samples,
+            incumbent_accuracy,
+            incumbent_accuracy,
         )
         default_recipe = self._default_recipe()
 
@@ -2197,20 +2465,29 @@ class NAS:
             ),
             reverse=True,
         )
-        eligible = [
-            trial
-            for trial in promoted
-            if (
-                trial["best_val_acc"] - incumbent_accuracy + 1e-12
-                >= acceptance_margin
+        eligible = []
+        selection_margins = []
+        for trial in promoted:
+            trial_margin = self._recipe_acceptance_margin(
+                incumbent_samples,
+                incumbent_accuracy,
+                trial["best_val_acc"],
             )
-        ]
+            trial["acceptance_margin"] = trial_margin
+            selection_margins.append(trial_margin)
+            if (
+                trial["best_val_acc"]
+                - incumbent_accuracy
+                + 1e-12
+                >= trial_margin
+            ):
+                eligible.append(trial)
         if not eligible:
             for trial in promoted:
                 del trial["model"]
             return restore_incumbent(
                 "no recipe beat it by the {:.2f}pp margin".format(
-                    acceptance_margin * 100
+                    min(selection_margins or [acceptance_margin]) * 100
                 )
             )
 
@@ -2223,9 +2500,6 @@ class NAS:
             confirmation_accuracy = float(
                 confirmation_incumbent["accuracy"]
             )
-            confirmation_margin = self._recipe_acceptance_margin(
-                confirmation_incumbent.get("samples", 0)
-            )
             confirmed = []
             for trial in eligible:
                 trial["model"].to(self.device)
@@ -2237,6 +2511,14 @@ class NAS:
                     metrics["accuracy"]
                 )
                 trial["confirmation_val_loss"] = float(metrics["loss"])
+                confirmation_margin = self._recipe_acceptance_margin(
+                    confirmation_incumbent.get("samples", 0),
+                    confirmation_accuracy,
+                    trial["confirmation_val_acc"],
+                )
+                trial["confirmation_acceptance_margin"] = (
+                    confirmation_margin
+                )
                 if (
                     trial["confirmation_val_acc"]
                     - confirmation_accuracy
@@ -2299,7 +2581,13 @@ class NAS:
                 selected["recipe"]["name"],
                 selected["best_val_acc"] * 100,
                 incumbent_accuracy * 100,
-                acceptance_margin * 100,
+                selected.get(
+                    "confirmation_acceptance_margin",
+                    selected.get(
+                        "acceptance_margin", acceptance_margin
+                    ),
+                )
+                * 100,
             )
         )
         return architecture_winner
@@ -2499,6 +2787,9 @@ class NAS:
             )
             for candidate in active:
                 candidate["refinement_history"] = []
+                candidate["_refinement_best_checkpoint"] = (
+                    self._snapshot_refinement_checkpoint(candidate)
+                )
 
             pass_index = 0
             while pass_index < 12 and len(active) >= 2:
@@ -2613,6 +2904,15 @@ class NAS:
                         candidate["val_acc"]
                     )
                     self._adapt_search_lr(candidate)
+                    best_checkpoint = candidate[
+                        "_refinement_best_checkpoint"
+                    ]
+                    if self._is_better_refinement_checkpoint(
+                        candidate, best_checkpoint
+                    ):
+                        candidate["_refinement_best_checkpoint"] = (
+                            self._snapshot_refinement_checkpoint(candidate)
+                        )
                     candidate["utility"] = self._candidate_utility(candidate)
                     candidate["model"].cpu()
                     refined.append(candidate)
@@ -2646,6 +2946,28 @@ class NAS:
                         "    refinement converged; all finalist gains <= 0.30pp"
                     )
                     break
+            for candidate in active:
+                best_checkpoint = candidate.pop(
+                    "_refinement_best_checkpoint", None
+                )
+                if best_checkpoint is None:
+                    continue
+                endpoint_accuracy = float(candidate.get("val_acc", 0.0))
+                self._restore_refinement_checkpoint(
+                    candidate, best_checkpoint
+                )
+                if (
+                    candidate["val_acc"]
+                    > endpoint_accuracy + 1e-12
+                ):
+                    print(
+                        "    restored {} best refinement checkpoint: "
+                        "{:.2f}% (endpoint {:.2f}%)".format(
+                            self._spec_label(candidate["spec"]),
+                            candidate["val_acc"] * 100,
+                            endpoint_accuracy * 100,
+                        )
+                    )
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -2717,53 +3039,18 @@ class NAS:
             )
         if not final_results:
             final_results = active
-        self._final_selection_scores(final_results)
-        final_results.sort(
-            key=lambda item: item.get("selection_score", -float("inf")),
-            reverse=True,
+        final_results, tie_threshold = self._order_final_results(
+            final_results
         )
-        if (
-            len(final_results) >= 2
-            and "confirmation_val_acc" in final_results[0]
-            and "confirmation_val_acc" in final_results[1]
-        ):
-            first, second = final_results[:2]
-            samples = max(
-                1,
-                min(
-                    int(first.get("confirmation_samples", 1)),
-                    int(second.get("confirmation_samples", 1)),
-                ),
-            )
-            first_acc = float(first["confirmation_val_acc"])
-            second_acc = float(second["confirmation_val_acc"])
-            pooled_se = math.sqrt(
-                (
-                    first_acc * (1.0 - first_acc)
-                    + second_acc * (1.0 - second_acc)
+        if tie_threshold is not None and len(final_results) >= 2:
+            final_results[0]["uncertainty_tie"] = True
+            final_results[1]["uncertainty_tie"] = True
+            print(
+                "  [NAS] Finalists overlap within {:.2f}pp; "
+                "confirmation loss resolves the tie".format(
+                    tie_threshold * 100
                 )
-                / samples
             )
-            tie_threshold = max(
-                1.0 / samples, min(0.01, 0.75 * pooled_se)
-            )
-            if abs(first_acc - second_acc) <= tie_threshold:
-                first["uncertainty_tie"] = True
-                second["uncertainty_tie"] = True
-                final_results[:2] = sorted(
-                    (first, second),
-                    key=lambda item: (
-                        -float(item.get("confirmation_val_loss", float("inf"))),
-                        item.get("selection_score", -float("inf")),
-                    ),
-                    reverse=True,
-                )
-                print(
-                    "  [NAS] Finalists overlap within {:.2f}pp; "
-                    "confirmation loss resolves the tie".format(
-                        tie_threshold * 100
-                    )
-                )
         winner = final_results[0]
         challenger = final_results[1] if len(final_results) >= 2 else None
         retained_challenger = None
@@ -2910,13 +3197,11 @@ class NAS:
             validation_batches,
             deadline_remaining,
         )
-        filtered_ranked = [
-            entry
-            for entry in ranked
-            if entry["spec"].model_family in promoted_families
-        ]
-        if filtered_ranked:
-            ranked = filtered_ranked
+        expanded_ranked = self._expand_promoted_macro_pool(
+            ranked, pool, promoted_families
+        )
+        if expanded_ranked:
+            ranked = expanded_ranked
         if (
             not cached_batches
             or self.clock.check() <= deadline_remaining + 8

@@ -145,11 +145,30 @@ class Trainer:
             label_smoothing=self.label_smoothing,
         )
 
-    def _select_alternative_recipe(self, excluded=None):
+    def _select_alternative_recipe(
+        self,
+        excluded=None,
+        prefer_regularized=False,
+    ):
         if not self.alternative_recipes:
             return None
         excluded = set(excluded or ())
         current = self.recipe.get("name")
+        if prefer_regularized:
+            for name in (
+                "regularized",
+                "balanced",
+                "stable",
+                "fast_fit",
+                "sgd_nesterov",
+            ):
+                for recipe in self.alternative_recipes:
+                    if (
+                        recipe.get("name") == name
+                        and name != current
+                        and name not in excluded
+                    ):
+                        return dict(recipe)
         if current == "regularized":
             for name in (
                 "sgd_nesterov",
@@ -172,6 +191,73 @@ class Trainer:
             ),
             None,
         )
+
+    @staticmethod
+    def _attempt_recovery_margin(reference_accuracy, samples):
+        """Bound noise when comparing an attempt with its starting best."""
+        samples = max(1, int(samples))
+        accuracy = min(1.0, max(0.0, float(reference_accuracy)))
+        standard_error = math.sqrt(
+            2.0 * accuracy * (1.0 - accuracy) / samples
+        )
+        return max(
+            0.005,
+            1.0 / samples,
+            min(0.015, 0.75 * standard_error),
+        )
+
+    @classmethod
+    def _attempt_rotation_reason(
+        cls,
+        *,
+        attempt_epochs,
+        attempt_best_val,
+        attempt_start_best_val,
+        epochs_without_improvement,
+        train_accuracy,
+        validation_accuracy,
+        current_lr,
+        base_lr,
+        validation_samples,
+        plateau_patience,
+    ):
+        """Detect unproductive attempts without cutting slow recoveries."""
+        margin = cls._attempt_recovery_margin(
+            attempt_start_best_val, validation_samples
+        )
+        generalization_gap = max(
+            0.0, float(train_accuracy) - float(validation_accuracy)
+        )
+        minimum_recovery_epochs = max(
+            10, 2 * int(plateau_patience) + 2
+        )
+        failed_to_recover = (
+            int(attempt_epochs) >= minimum_recovery_epochs
+            and float(attempt_best_val) + margin
+            < float(attempt_start_best_val)
+            and int(epochs_without_improvement)
+            >= max(5, int(plateau_patience) + 2)
+            and generalization_gap >= 0.12
+        )
+        if failed_to_recover:
+            return "failed to recover the preserved baseline"
+
+        # An attempt that already proved useful gets a much longer runway.
+        # Requiring both a decayed LR and a long plateau avoids cutting the
+        # delayed recovery observed on structured tasks.
+        productive_plateau = (
+            float(attempt_best_val)
+            >= float(attempt_start_best_val) + margin
+            and int(attempt_epochs)
+            >= max(30, 6 * int(plateau_patience))
+            and int(epochs_without_improvement)
+            >= max(24, 6 * int(plateau_patience))
+            and float(current_lr) <= 0.40 * max(1e-12, float(base_lr))
+            and generalization_gap >= 0.10
+        )
+        if productive_plateau:
+            return "productive attempt plateaued with a large generalization gap"
+        return None
 
     @staticmethod
     def _sync(device):
@@ -502,6 +588,16 @@ class Trainer:
         if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(validation_accuracy)
         else:
+            # CosineAnnealingLR is periodic after T_max. The controller wants
+            # a one-way cooldown, not an implicit warm restart when measured
+            # epochs exceed the initial estimate.
+            if (
+                isinstance(
+                    scheduler, optim.lr_scheduler.CosineAnnealingLR
+                )
+                and scheduler.last_epoch >= scheduler.T_max
+            ):
+                return
             scheduler.step()
 
     def _set_warmup_lr(self, optimizer, global_step):
@@ -519,11 +615,19 @@ class Trainer:
             1.0 + math.cos(math.pi * progress)
         )
 
-    def _apply_time_cooldown(self, optimizer, elapsed):
+    def _apply_time_cooldown(
+        self,
+        optimizer,
+        elapsed,
+        previous_lr=None,
+    ):
         """Monotonic LR ceiling within the current optimization attempt."""
         ceiling = self._time_cooldown_ceiling(elapsed)
         for group in optimizer.param_groups:
-            group["lr"] = min(group["lr"], ceiling)
+            candidates = [float(group["lr"]), float(ceiling)]
+            if previous_lr is not None:
+                candidates.append(float(previous_lr))
+            group["lr"] = min(candidates)
 
     @staticmethod
     def _cpu_state_dict(model):
@@ -615,6 +719,8 @@ class Trainer:
         checkpoint_pool = [(initial_val_acc, self._cpu_state_dict(model))]
         best_recipe = dict(self.recipe)
         attempt_best_val = initial_val_acc
+        attempt_start_best_val = best_val_acc
+        attempt_epochs = 0
         epochs_without_improvement = 0
         lr_reductions = 0
         independent_retry_count = 0
@@ -625,6 +731,14 @@ class Trainer:
         measured_epoch_time = self.epoch_time_estimate
         training_started = time.perf_counter()
         attempt_started = training_started
+        try:
+            validation_samples = max(
+                1, int(len(self.valid_dataloader.dataset))
+            )
+        except (AttributeError, TypeError):
+            validation_samples = max(
+                1, int(self.metadata.get("valid_num_samples", 1))
+            )
 
         print(
             "  [Trainer] Recipe: {} | LR {:.2e} | WD {:.2e} | "
@@ -636,10 +750,20 @@ class Trainer:
                 self.mixup_alpha,
             )
         )
+        if str(self.recipe.get("scheduler", "plateau")).lower() == "cosine":
+            scheduler_description = (
+                "cosine, no restart, initial horizon {} epochs".format(
+                    self.safe_epochs
+                )
+            )
+        else:
+            scheduler_description = "plateau, patience {}".format(
+                self.plateau_patience
+            )
         print(
-            "  [Trainer] Warmup {} steps; plateau patience {}; AMP {}".format(
+            "  [Trainer] Warmup {} steps; scheduler {}; AMP {}".format(
                 self.warmup_steps,
-                self.plateau_patience,
+                scheduler_description,
                 self.use_amp,
             )
         )
@@ -753,6 +877,7 @@ class Trainer:
 
             val_acc = self._evaluate(model)
             completed_epochs += 1
+            attempt_epochs += 1
             train_acc = correct / max(1, total)
             actual_epoch_time = time.perf_counter() - epoch_started
             measured_epoch_time = (
@@ -798,13 +923,23 @@ class Trainer:
             current_lr = optimizer.param_groups[0]["lr"]
             if current_lr < previous_lr * 0.99:
                 lr_reductions += 1
+                scheduler_name = (
+                    "Plateau"
+                    if isinstance(
+                        plateau_scheduler,
+                        optim.lr_scheduler.ReduceLROnPlateau,
+                    )
+                    else "Cosine"
+                )
                 print(
-                    "  [Trainer] Plateau: LR reduced {:.2e} -> {:.2e}".format(
-                        previous_lr, current_lr
+                    "  [Trainer] {}: LR reduced {:.2e} -> {:.2e}".format(
+                        scheduler_name, previous_lr, current_lr
                     )
                 )
             self._apply_time_cooldown(
-                optimizer, time.perf_counter() - attempt_started
+                optimizer,
+                time.perf_counter() - attempt_started,
+                previous_lr=previous_lr,
             )
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -857,12 +992,28 @@ class Trainer:
                 and epochs_without_improvement
                 >= max(8, 2 * self.plateau_patience)
             )
+            rotation_reason = self._attempt_rotation_reason(
+                attempt_epochs=attempt_epochs,
+                attempt_best_val=attempt_best_val,
+                attempt_start_best_val=attempt_start_best_val,
+                epochs_without_improvement=epochs_without_improvement,
+                train_accuracy=train_acc,
+                validation_accuracy=val_acc,
+                current_lr=current_lr,
+                base_lr=self.base_lr,
+                validation_samples=validation_samples,
+                plateau_patience=self.plateau_patience,
+            )
             attempt_exhausted = (
                 low_lr and epochs_without_improvement >= 10
-            ) or benchmark_plateau
+            ) or benchmark_plateau or rotation_reason is not None
             if attempt_exhausted:
                 alternative = self._select_alternative_recipe(
-                    attempted_recipes
+                    attempted_recipes,
+                    prefer_regularized=(
+                        rotation_reason is not None
+                        and train_acc - val_acc >= 0.12
+                    ),
                 )
                 retry_epochs = 4 if below_benchmark else 6
                 enough_for_retry = (
@@ -899,6 +1050,8 @@ class Trainer:
                             key: value.detach().cpu().clone()
                             for key, value in model.state_dict().items()
                         }
+                    attempt_start_best_val = best_val_acc
+                    attempt_epochs = 0
                     epochs_without_improvement = 0
                     lr_reductions = 0
                     attempt_step = 0
@@ -920,13 +1073,18 @@ class Trainer:
                     )
                     print(
                         "  [Trainer] Independent attempt {} from common NAS "
-                        "checkpoint: recipe={} | baseline={:.2f}%{}".format(
+                        "checkpoint: recipe={} | baseline={:.2f}%{}{}".format(
                             independent_retry_count + 1,
                             self.recipe.get("name", "stable"),
                             attempt_best_val * 100,
                             " | benchmark still unmet"
                             if below_benchmark
                             else "",
+                            (
+                                " | trigger={}".format(rotation_reason)
+                                if rotation_reason is not None
+                                else ""
+                            ),
                         )
                     )
                     continue
@@ -973,6 +1131,8 @@ class Trainer:
                         best_model_state = self._cpu_state_dict(model)
                         best_model_prototype = copy.deepcopy(model).cpu()
                         best_architecture_id = current_architecture_id
+                    attempt_start_best_val = best_val_acc
+                    attempt_epochs = 0
                     epochs_without_improvement = 0
                     lr_reductions = 0
                     attempt_step = 0
@@ -1042,6 +1202,8 @@ class Trainer:
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(continuation_seed)
                     attempt_best_val = best_val_acc
+                    attempt_start_best_val = best_val_acc
+                    attempt_epochs = 0
                     epochs_without_improvement = 0
                     lr_reductions = 0
                     attempt_step = 0

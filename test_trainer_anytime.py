@@ -98,6 +98,116 @@ def test_sgd_nesterov_uses_cosine_and_rejects_adam_moments():
     )
 
 
+def test_cosine_scheduler_cannot_rebound_after_initial_horizon():
+    loader, _ = _loaders()
+    model = _CountingModel()
+    model.training_recipe = {
+        "name": "sgd_nesterov",
+        "optimizer": "sgd",
+        "scheduler": "cosine",
+        "final_lr": 0.02,
+        "momentum": 0.9,
+        "nesterov": True,
+        "weight_decay": 5e-4,
+        "label_smoothing": 0.0,
+        "mixup_alpha": 0.0,
+    }
+    trainer = Trainer(
+        model,
+        torch.device("cpu"),
+        loader,
+        loader,
+        _metadata(),
+        _ConstantClock(),
+    )
+    trainer.safe_epochs = 2
+    optimizer, scheduler = trainer._make_optimizer_and_scheduler(model)
+    optimizer.param_groups[0]["lr"] = trainer.base_lr
+    learning_rates = [optimizer.param_groups[0]["lr"]]
+    for _ in range(6):
+        previous = optimizer.param_groups[0]["lr"]
+        optimizer.step()
+        trainer._step_scheduler(scheduler, 0.5)
+        trainer._apply_time_cooldown(
+            optimizer, elapsed=0.0, previous_lr=previous
+        )
+        learning_rates.append(optimizer.param_groups[0]["lr"])
+    assert all(
+        current <= previous + 1e-12
+        for previous, current in zip(
+            learning_rates, learning_rates[1:]
+        )
+    )
+    assert learning_rates[-1] == learning_rates[2]
+
+
+def test_attempt_rotation_distinguishes_failure_from_slow_recovery():
+    failure = Trainer._attempt_rotation_reason(
+        attempt_epochs=12,
+        attempt_best_val=0.3967,
+        attempt_start_best_val=0.4123,
+        epochs_without_improvement=6,
+        train_accuracy=0.6631,
+        validation_accuracy=0.3949,
+        current_lr=0.019,
+        base_lr=0.020,
+        validation_samples=5_000,
+        plateau_patience=4,
+    )
+    assert failure is not None
+
+    slow_recovery = Trainer._attempt_rotation_reason(
+        attempt_epochs=32,
+        attempt_best_val=0.8465,
+        attempt_start_best_val=0.8410,
+        epochs_without_improvement=24,
+        train_accuracy=1.0,
+        validation_accuracy=0.8271,
+        current_lr=0.016,
+        base_lr=0.020,
+        validation_samples=5_000,
+        plateau_patience=5,
+    )
+    assert slow_recovery is None
+
+    exhausted_success = Trainer._attempt_rotation_reason(
+        attempt_epochs=80,
+        attempt_best_val=0.8643,
+        attempt_start_best_val=0.8410,
+        epochs_without_improvement=30,
+        train_accuracy=1.0,
+        validation_accuracy=0.8521,
+        current_lr=0.0075,
+        base_lr=0.020,
+        validation_samples=5_000,
+        plateau_patience=5,
+    )
+    assert exhausted_success is not None
+
+
+def test_large_generalization_gap_prioritizes_regularized_retry():
+    loader, _ = _loaders()
+    model = _CountingModel()
+    trainer = Trainer(
+        model,
+        torch.device("cpu"),
+        loader,
+        loader,
+        _metadata(),
+        _ConstantClock(),
+    )
+    trainer.recipe = {"name": "sgd_nesterov"}
+    trainer.alternative_recipes = [
+        {"name": "stable"},
+        {"name": "regularized"},
+        {"name": "fast_fit"},
+    ]
+    selected = trainer._select_alternative_recipe(
+        {"sgd_nesterov"}, prefer_regularized=True
+    )
+    assert selected["name"] == "regularized"
+
+
 def test_safe_flip_tta_averages_three_views():
     loader, data = _loaders(samples=8)
     model = _CountingModel()
@@ -175,6 +285,9 @@ def test_clock_driven_training_and_prediction_complete():
 
 if __name__ == "__main__":
     test_sgd_nesterov_uses_cosine_and_rejects_adam_moments()
+    test_cosine_scheduler_cannot_rebound_after_initial_horizon()
+    test_attempt_rotation_distinguishes_failure_from_slow_recovery()
+    test_large_generalization_gap_prioritizes_regularized_retry()
     test_safe_flip_tta_averages_three_views()
     test_dormant_challenger_is_not_a_registered_branch()
     test_clock_driven_training_and_prediction_complete()

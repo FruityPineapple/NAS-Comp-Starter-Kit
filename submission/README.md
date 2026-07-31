@@ -30,14 +30,21 @@ multi-hour runs. Search and prediction deadlines remain protected.
   volumetric, coordinate, hybrid, pre-activation wide/grouped, and dense
   feature-reuse families.
 - Label-trained representation probes promote two families, with a third only
-  on an uncertainty tie; macro search then stays inside promoted families.
+  on an uncertainty tie; macro search then restores full compact-to-wide size
+  coverage inside the promoted families.
 - Progressive data coverage, optimizer-state continuation, logical-batch
   microbatch accumulation, and OOM retry.
-- Incumbent-safe two-stage recipe selection using confirmation evidence.
-- AdamW controls plus zero-smoothing SGD/Nesterov with cosine decay.
+- Best-stage architecture restoration and confirmation-dominant finalist
+  selection, with historical rank used only for statistical ties.
+- Incumbent-safe two-stage recipe selection using uncertainty-aware
+  confirmation evidence.
+- AdamW controls plus zero-smoothing SGD/Nesterov with monotonic, no-restart
+  cosine decay.
 - Clock-driven final attempts across every untried recipe, an optional tied
   architecture challenger, fresh-seed continuations, EMA, and tested
   same-architecture checkpoint averaging.
+- Early rotation of attempts that fail to recover the immutable baseline,
+  while productive slow-recovery attempts retain a longer runway.
 - TTA only for flip policies that passed both invariance and functional
   validation probes.
 - Recursive prediction splitting preserves complete test order after OOM.

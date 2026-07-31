@@ -1,13 +1,13 @@
 # NAS Improvement Plan
 
-**Status:** All rule-neutral implementation work in Priorities 0-5 is now
-complete and locally tested. Two deliberately conditional experiments remain
-disabled: train-plus-validation refit pending broad historical ablation, and
-an ensemble pending explicit organizer confirmation. Historical-dataset and
-CUDA reruns also remain outstanding because those resources are not in this
-workspace.
+**Status:** All rule-neutral implementation work in Priorities 0-5 and the
+31 July controller-correction pass is complete and locally tested. Two
+deliberately conditional experiments remain disabled: train-plus-validation
+refit pending broad historical ablation, and an ensemble pending explicit
+organizer confirmation. The corrected controller still requires a fresh
+multi-seed historical/CUDA rerun.
 
-**Date:** 30 July 2026
+**Date:** 31 July 2026
 
 ## 0. Current implementation completion record
 
@@ -35,8 +35,8 @@ they describe the repository as it existed before implementation.
 - [x] Scalable Tier-1 search budget and a clock-driven final action queue
   covering every recipe, a tied challenger, fresh-seed continuations, EMA,
   checkpoint averaging, and validated-flip TTA.
-- [x] Focused memory, objective, architecture, trainer, and accelerated
-  end-to-end regression tests.
+- [x] Focused controller, objective, architecture, trainer, data, memory, and
+  accelerated end-to-end regression tests.
 - [x] Fix the CUDA representation-probe regression exposed by the first
   post-implementation three-dataset run: every controller evaluation now
   places a fresh or CPU-parked model on the controller device before the
@@ -44,8 +44,21 @@ they describe the repository as it existed before implementation.
 - [x] Make controller validation recursively split an oversized batch after
   CUDA OOM while preserving sample order, and contain a malformed
   representation family instead of aborting the entire dataset.
+- [x] Preserve and restore each architecture finalist's best refinement model,
+  optimizer, step, and data-cursor state.
+- [x] Make confirmation accuracy dominant in final architecture selection;
+  adaptive history is now a statistical-tie-only signal.
+- [x] Replace the one-example recipe threshold with a bounded
+  uncertainty-aware margin on both selection and confirmation.
+- [x] Restore the complete feasible size range after family promotion and add
+  a genuinely wide deterministic anchor for full-grid families.
+- [x] Rotate a final-training attempt early when it fails to recover the
+  immutable baseline, while retaining a longer guarded runway for productive
+  slow recoveries.
+- [x] Prevent SGD cosine decay from rebounding after its initial horizon and
+  label scheduler diagnostics accurately.
 - [ ] Run the original three and broader historical datasets with multiple
-  seeds after the CUDA fix; their arrays are not present locally.
+  seeds after the 31 July corrections; their arrays are not present locally.
 - [ ] Complete a successful real-CUDA peak-memory/OOM validation after the
   fix; the local PyTorch runtime is CPU-only.
 - [ ] Enable train-plus-validation refit only if leave-one-dataset-out
@@ -56,22 +69,71 @@ The exact active architecture is documented in
 `submission/NAS_ARCHITECTURE.md`.
 
 **Primary evidence:** The current repository, the competition evaluator, the
-original successful three-dataset run log at:
+original successful three-dataset baseline log at:
 
 `C:\Users\Lennart\.codex\attachments\4a0d3e89-fc84-49a2-802e-4255e45f0318\pasted-text.txt`
 
-and the post-implementation CUDA failure log at:
+the invalid-runtime failure log at:
 
 `C:\Users\Lennart\.codex\attachments\548f438a-769b-4a6f-9a48-37f91aefaa3c\pasted-text.txt`
 
-The latter failed identically on Adaline, Gutenberg, and LaMelo before any
-family-probe training. `_representation_probe_race()` constructed a model on
-CPU and immediately called `_evaluate()`, while `_evaluate()` moved only its
-input to CUDA. AMP therefore supplied a CUDA half-precision input to CPU
-float32 convolution weights. The device-safe evaluation boundary described
-above directly fixes that common traceback. The scorer's later NumPy `int64`
-JSON-serialization message occurred only after all dataset executions had
-already failed and is not the causal submission error.
+and the latest successful pre-correction run at:
+
+`C:\Users\Lennart\.codex\attachments\d2ca2821-4622-492f-b61d-bd7cac87de6d\pasted-text.txt`
+
+The middle log used the wrong runtime and is not evidence of a submission
+defect. Device-safe evaluation and OOM splitting remain useful defensive
+invariants, but the failure must not be used to justify performance decisions.
+
+The latest successful run scored **4.233 adjusted points**:
+
+| Dataset | Test accuracy | Adjusted score | Runtime |
+|---|---:|---:|---:|
+| AddNIST / Adaline | 93.280% | +3.379 | 1767.9s |
+| Gutenberg | 41.950% | +0.164 | 1775.3s |
+| Language / LaMelo | 86.220% | +0.689 | 1773.9s |
+
+Compared with the earlier 5.135 baseline, AddNIST changed by -0.810 raw
+points, Gutenberg by -5.717, and Language by +1.280. A single deterministic
+run is not sufficient to establish expected performance, but it exposed six
+controller-level problems addressed by the checked items above.
+
+### 0.1 Evidence-to-change map for the 31 July correction pass
+
+The following observations come from the latest successful **pre-correction**
+run. They are the empirical baseline for the current code; no post-correction
+competition-style accuracy run has yet been supplied.
+
+| Weakness | Exact run-log evidence | Implemented correction |
+|---|---|---|
+| Finalist refinement returned the endpoint instead of the best checkpoint | AddNIST spatial fell from 75.50% to 72.14%; Gutenberg pyramid from 41.26% to 40.96%; Language pyramid from 79.55% to 78.35% | Snapshot and restore each finalist's best model, matching optimizer, step count, and data cursor |
+| Adaptive rank history could override both independent holdouts | On AddNIST, spatial was selected at 72.14% selection / 71.26% confirmation over pyramid at 74.94% / 74.68% | Make confirmation accuracy decisive outside a bounded uncertainty band; use loss, combined holdout score, and historical rank only inside that band |
+| A statistically tiny recipe gain could replace the incumbent | Gutenberg selected SGD on a gain of only 0.20 percentage points | Require `max(configured floor, 1/N, min(1pp, 0.75 * pooled SE))` on selection and confirmation |
+| Proxy subsampling could remove useful capacity before label training | The 12 Gutenberg label candidates contained no C64 spatial model although the earlier 47.667% winner was C64 spatial | Restore every feasible macro size in promoted families, add a deterministic C64 anchor, and select label candidates across log-parameter strata |
+| A failed optimizer could consume most final-training time | Gutenberg SGD used 105 of 154 logged epochs without recovering the 41.23% warm baseline; regularized received only 21 epochs | Rotate a sufficiently overfit, stalled attempt early when it has not recovered its starting global best; prefer a regularized alternative |
+| Productive attempts could run long after their best, and cosine SGD could rebound | Language peaked at 86.43% around epoch 51 and continued for about 83 epochs; AddNIST trained beyond a cosine horizon of 49 and its LR rose from about `2e-4` to `5.9e-4` | Give productive attempts a guarded long runway, then rotate on a late plateau; freeze cosine at `T_max` and clamp every time-based LR update monotonically |
+
+Expected benefits are lower architecture-selection regret, less destructive
+overtraining, more reliable recipe replacement, and better coverage of
+unknown capacity requirements. The main risk is spending label-training work
+on weak size strata or rotating a genuinely slow recovery. Those risks are
+bounded by family promotion, fixed finalist count, conservative rotation
+conditions, an immutable global best checkpoint, and the external clock.
+
+Local CPU verification on 31 July passed:
+
+- bytecode compilation for `submission/` and the affected tests;
+- `test_controller_refinements.py`, `test_search_objective.py`,
+  `test_trainer_anytime.py`, `test_architecture_fixes.py`,
+  `test_data_processor.py` (7/7), and `test_memory_safety.py`;
+- the accelerated Tier-1 end-to-end pipeline, including complete ordered
+  prediction;
+- a short real-clock Tier-3 `run_pipeline()` smoke test.
+
+The Miniconda runtime does not include pytest, so the repository's executable
+assertion-based test entry points were used. PyTorch emitted existing AMP API
+deprecation warnings only. These checks establish regression safety, not
+post-correction dataset accuracy.
 
 ## 1. Executive summary
 
@@ -92,22 +154,25 @@ The foundation is sound and should be retained:
 - best-checkpoint restoration;
 - CUDA OOM fallbacks.
 
-The dominant performance problems are not a lack of additional zero-cost
-proxies. The latest run shows that:
+The dominant performance problems were not a lack of additional zero-cost
+proxies. Historical runs and the latest successful pre-correction run exposed:
 
-1. architecture candidates are compared before their learning curves are
-   informative;
-2. the one-epoch recipe tournament selected the eventual best recipe on only
-   one of three datasets and can return a model worse than its input
-   checkpoint;
-3. the controller is not truly anytime and left 8-12 minutes unused on two
-   30-minute datasets;
-4. the search objective and uncertainty handling are imperfect;
-5. the architecture portfolio still assumes too much about the semantic
-   meaning of channels, height, and width;
-6. large-input RAM safety has not been exercised by the latest run.
+1. best refinement checkpoints being replaced by worse endpoints;
+2. historical rank overriding clearly better selection and confirmation
+   accuracy;
+3. recipe replacement on gains too small to distinguish from validation
+   noise;
+4. promoted families losing their wide capacity options before label
+   training;
+5. failed or exhausted final-training attempts monopolizing the clock;
+6. cosine SGD increasing its learning rate after the intended decay horizon.
 
-The recommended direction is therefore:
+All six are now corrected in code and covered by focused regression tests. The
+remaining gap is empirical rather than architectural: the corrected controller
+still needs multi-seed runs on the original three datasets, broader historical
+datasets, and a competition-compatible CUDA runtime.
+
+The implemented direction is:
 
 > Keep the independent-model portfolio, but reorganize it around small
 > label-aware representation probes, meaningful minimum fidelity, an
@@ -115,12 +180,13 @@ The recommended direction is therefore:
 > controller. Add new representation families only after the controller can
 > measure them reliably.
 
-The recommended first implementation step was a **controller-only change**:
+The first implementation step was a **controller-only change**:
 replace the one-stage recipe tournament with an incumbent-preserving,
 two-stage recipe race evaluated on the same validation data, while leaving the
 architecture families unchanged. This step is now implemented. Optimizer
-expansion, architecture-family changes, augmentation changes, and the other
-priorities in this document have deliberately not been bundled with it.
+expansion, architecture-family changes, augmentation changes, and later
+controller corrections were implemented as separately testable follow-up
+changes rather than folded into that first step.
 
 ## 2. Competition objective and constraints
 
@@ -244,23 +310,29 @@ ordered pooling bins. Spatial-pyramid models retain only a global bin and a
 - Tier 2, 5-15 minutes: 30 proxy candidates and 7 label-trained finalists;
 - Tier 3, under 5 minutes: direct portfolio anchor.
 
-Tier 1 search is capped at 18% of remaining time or 360 seconds. Tier 2 is
-capped at 12% or 120 seconds.
+Tier 1 assigns 22% of remaining time to search and scales its ceiling from six
+minutes up to 30 minutes on long runs. Tier 2 remains capped at 12% or 120
+seconds.
 
 The Tier 1 pipeline is:
 
 1. build a parameter-filtered candidate pool;
 2. sample architectures across active families and parameter-size strata;
 3. compute SynFlow, Jacobian correlation, NASWOT, and proxy latency;
-4. assign equal family quotas to 12 label-aware entries;
-5. train them for three successive-halving rounds on a cached partial epoch;
-6. retain AdamW optimizer state between rounds;
-7. refine the final two on a deterministic full-data stream;
-8. evaluate both on full validation;
-9. select using full validation, preceding fidelity, and rank history;
-10. clone the winning checkpoint and give each active recipe one equal
-    training segment;
-11. return the best recipe trial as the warm-started model.
+4. run equal-work, label-aware representation-family probes;
+5. promote the best families with uncertainty-aware ties;
+6. restore every feasible macro size for promoted families and choose 12
+   label-aware candidates with family quotas and log-parameter coverage;
+7. train them with progressive data coverage and multi-fidelity halving;
+8. adaptively refine the final two while preserving each one's best matching
+   model and optimizer state;
+9. compare them on prior-preserving selection and disjoint confirmation
+   splits, with confirmation dominance and historical rank used only for
+   statistical ties;
+10. compare the unchanged architecture checkpoint with every active recipe in
+    a fair two-stage race;
+11. return a recipe checkpoint only when its uncertainty-bounded improvement
+    also confirms; otherwise return the incumbent.
 
 The final architecture search uses one neutral `architecture_probe` recipe.
 The active final recipes are:
@@ -268,7 +340,8 @@ The active final recipes are:
 - `stable`;
 - `regularized`;
 - `balanced` when class imbalance is detected;
-- otherwise `fast_fit` when examples per class are high.
+- otherwise `fast_fit` when examples per class are high;
+- zero-smoothing SGD with Nesterov momentum and monotonic cosine decay.
 
 ### 3.4 Final trainer
 
@@ -276,21 +349,31 @@ The active final recipes are:
 
 - real train/validation throughput calibration;
 - measured prediction-time reservation;
-- AdamW continuation from the selected search state;
+- optimizer-matched continuation from the selected search state;
 - AMP on CUDA;
 - gradient clipping;
 - label smoothing, optional MixUp, and optional class weighting;
-- warmup, validation-driven LR reduction, and a wall-clock cosine LR ceiling;
+- warmup, validation-driven AdamW reduction, or no-restart cosine SGD;
 - full-validation checkpoint selection;
-- independent recipe attempts from a common NAS checkpoint;
+- clock-driven independent recipe attempts from a common NAS checkpoint;
+- early rotation of failed recoveries and guarded rotation of late productive
+  plateaus;
+- preference for regularized recipes after a strongly overfit failure;
+- optional statistically tied architecture challenger, fresh-seed
+  continuations, EMA, and same-architecture checkpoint averaging;
 - recursive prediction-batch splitting after CUDA OOM;
 - restoration of the globally best checkpoint before prediction.
 
-The trainer currently allows up to one independent retry when the benchmark is
-already met and up to two retries while it remains unmet. It can stop after
-available recipes are exhausted even when substantial safe time remains.
+The external clock and measured prediction reserve are the effective stopping
+conditions. A very high 100,000-epoch ceiling exists only as protection
+against a broken synthetic clock; exhausting a fixed retry count no longer
+ends an otherwise safe run.
 
-## 4. Evidence from the latest run: baseline facts
+## 4. Original successful baseline facts
+
+This section records the first successful run used to design Priorities 0-5.
+It is historical evidence, not the latest executable result; Section 0 records
+the latest successful pre-correction run.
 
 All three local datasets lacked a `time_limit` metadata field, so the evaluator
 used its 30-minute default.
@@ -313,7 +396,11 @@ This does not change model ordering within a dataset, but it emphasizes that a
 small regression on a high-benchmark dataset can erase a large gain on a
 low-benchmark dataset.
 
-## 5. Most important weaknesses and latest-run evidence
+## 5. Original weaknesses and historical run evidence
+
+The implementation descriptions in this section intentionally describe the
+old controller that produced the 5.135 baseline. The completion record and
+Section 0.1 state how each applicable weakness is handled now.
 
 ### 5.1 Early architecture fidelity is not predictive enough
 
@@ -327,7 +414,7 @@ low-benchmark dataset.
 The first three rounds use at most a cached partial epoch and repeatedly start
 at the beginning of that cache. Accuracy is the dominant promotion signal.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 On AddNIST, the eventual winner had:
 
@@ -371,7 +458,7 @@ Each recipe receives a single equal segment, normally at most one epoch, from
 the common architecture checkpoint. The best endpoint accuracy is selected.
 The unchanged common checkpoint is not included as a competing incumbent.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 AddNIST:
 
@@ -415,7 +502,7 @@ it beyond noise.
 - `Trainer.max_epochs = 400`;
 - the retry-count and recipe-exhaustion exit in `Trainer.train()`.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 - AddNIST used 97.9% of the 30-minute budget.
 - Gutenberg ended with about 12m29s remaining and used only 58.4%.
@@ -427,10 +514,10 @@ remained. Language exhausted three recipes but then stopped rather than using
 the remaining time for a new seed, EMA/SWA, a challenger architecture, or an
 incumbent-safe continuation.
 
-For a multi-hour Phase 3 run, search is still capped at six minutes and the
-trainer is still capped at 400 epochs or a small number of recipe attempts.
-The current code therefore does not scale its exploration with the unknown
-final time allocation.
+For a multi-hour Phase 3 run, search was still capped at six minutes and the
+trainer was still capped at 400 epochs or a small number of recipe attempts.
+That controller therefore did not scale its exploration with the unknown final
+time allocation.
 
 **Why it matters**
 
@@ -460,7 +547,7 @@ Final selection blends:
 It does not estimate whether finalist differences are statistically
 meaningful.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 Gutenberg finalists had:
 
@@ -490,7 +577,7 @@ Family quotas successfully prevent total family elimination, which is a
 strength. However, proxy ranking still decides which parameter strata and
 which individual candidates enter label-aware training.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 For all three datasets, all proxy top-three candidates were `factorized`.
 None of the three final winners was factorized:
@@ -501,7 +588,7 @@ None of the three final winners was factorized:
 
 This does not prove that proxies are harmful because the quota system kept
 other families alive. It does show that their cross-family ranking has almost
-no positive evidence in the latest run. Proxy effort should not be increased
+no positive evidence in the original run. Proxy effort should not be increased
 until its selected-versus-final rank correlation has been measured.
 
 ### 5.6 Input fingerprinting does not cover enough axis semantics
@@ -513,7 +600,7 @@ until its selected-versus-final rank correlation has been measured.
 - `SearchSpace._build_axis_encoder()`
 - `SearchSpace._build_spatial_model()`
 
-The current content fingerprint is strongest for sparse one-hot grids. It does
+The old content fingerprint was strongest for sparse one-hot grids. It did
 not explicitly detect:
 
 - independent per-channel views;
@@ -523,7 +610,7 @@ not explicitly detect:
 - fixed-coordinate scientific data where translation/crop augmentation is
   invalid.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 The fingerprint did correctly identify two one-hot structures:
 
@@ -571,7 +658,7 @@ The DataProcessor commits to one augmentation policy before any architecture
 or recipe training. Recipes vary MixUp and regularization but cannot compare
 identity, crop, translation, or flip policies.
 
-The current structural rules also conflate modality with grayscale/color:
+The old structural rules also conflated modality with grayscale/color:
 
 - grayscale data bypasses the label-aware flip probe;
 - standardized or structured multi-channel data can still receive random
@@ -579,7 +666,7 @@ The current structural rules also conflate modality with grayscale/color:
 - one-hot sequences receive no geometry, which is appropriate for the logged
   language tasks but is not a general solution.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 - AddNIST received random crop and no flips.
 - Gutenberg and Language received normalization only.
@@ -598,12 +685,12 @@ policy dimension, not a hard preprocessing commitment.
 - `Trainer._make_optimizer_and_scheduler()`
 - `Trainer.train()`
 
-All active recipes use AdamW. The recipe space varies only LR scale, weight
-decay, label smoothing, MixUp, and class weights. Architecture dropout is tied
-to channel count rather than searched. There is no EMA, SWA, optimizer
-alternative, stochastic depth, or optional post-selection refit.
+All recipes in that run used AdamW. The recipe space varied only LR scale,
+weight decay, label smoothing, MixUp, and class weights. Architecture dropout
+was tied to channel count rather than searched. There was no EMA, SWA,
+optimizer alternative, stochastic depth, or optional post-selection refit.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 Language repeatedly reached approximately 100% training accuracy while
 validation stayed around 83-85%. Three optimizer restarts changed the path but
@@ -636,7 +723,7 @@ Potential large allocations include:
 - caching up to 4,096 validation samples without a byte cap;
 - keeping multiple models and two-moment AdamW states.
 
-**Latest-run evidence**
+**Original-run evidence**
 
 The latest inputs were only 24-28 pixels per side and all used batch size 128.
 No RAM or VRAM failure occurred. Consequently, the run does not validate the
@@ -711,13 +798,16 @@ Completed implementation scope:
 - `submission/nas.py` now measures unsmoothed validation cross-entropy,
   evaluates the incumbent and all trials on the identical source, stages
   recipe promotion, restores the best evaluated stage, and applies an
-  acceptance margin of at least 0.10 percentage points or one validation
-  example.
+  acceptance margin of
+  `max(0.10pp configured floor, one validation example,
+  min(1pp, 0.75 * pooled standard error))` separately on selection and
+  confirmation.
 - `test_controller_refinements.py` covers incumbent preservation, identical
   initial states and seeds, equal stage work, loss-slope ranking, checkpoint
-  restoration, optimizer-state ownership, and short-budget fallback.
-- No optimizer family, architecture family, augmentation, or final-Trainer
-  behavior was changed in this step.
+  restoration, optimizer-state ownership, rejection of a Gutenberg-sized
+  marginal gain, and short-budget fallback.
+- This first step did not change any independent architecture, augmentation,
+  or final-Trainer behavior. Those were added and tested in later steps.
 
 Expected benefit:
 
@@ -755,6 +845,11 @@ Changes:
    0.03-point difference with old ranks.
 9. [x] Retain the second finalist's specification and optional checkpoint for an
    anytime fallback.
+10. [x] Restore the best adaptive-refinement checkpoint and its matching
+    optimizer/data-stream state before final holdout comparison.
+11. [x] Restore the complete feasible macro pool after family promotion and
+    choose within-family candidates across log-parameter strata, including a
+    deterministic C64 anchor for full-grid families.
 
 Expected benefit:
 
@@ -791,6 +886,13 @@ Changes:
 4. [x] Keep the global best validation checkpoint immutable.
 5. [x] Estimate prediction reserve from measured batches with a conservative upper
    bound rather than an unconditional 180-second maximum.
+6. [x] Rotate a failed recovery early only after enough epochs, validation
+   stalls, failure to recover the attempt's starting best, and a large
+   train-validation gap.
+7. [x] Give productive slow recoveries a longer runway, then rotate only after
+   a sustained late plateau.
+8. [x] Stop cosine SGD at its initial `T_max` and prevent all time-based LR
+   cooldowns from increasing the current learning rate.
 
 A reasonable initial 30-minute split to test is:
 
@@ -808,9 +910,12 @@ final model, so its entire budget should not be treated as discarded compute.
 
 Expected benefit:
 
-- recovers the 29% and 42% unused budget observed on Language and Gutenberg;
+- addresses the 29% and 42% unused budget observed on the original Language
+  and Gutenberg run;
 - adapts to multi-hour final runs;
-- permits additional seeds or representations without risking the best model.
+- permits additional seeds or representations without risking the best model;
+- avoids spending most of the budget on a failed optimizer while preserving
+  genuinely productive slow recoveries.
 
 Primary risk:
 
@@ -973,8 +1078,8 @@ remains an empirical follow-up rather than enabled competition behavior.
 
 | File | Components | Planned responsibility |
 |---|---|---|
-| `submission/nas.py` | `_cache_validation_batches`, `_train_low_fidelity`, `_candidate_utility`, `_final_selection_scores`, `_recipe_tournament`, `_successive_halving`, `_search_pipeline`, time-tier configuration | Prior-preserving validation, loss/margin metrics, uncertainty-aware racing, incumbent-safe recipe ASHA, scalable budgets, retained challenger |
-| `submission/trainer.py` | recipe application, optimizer construction, scheduler construction, retry logic, time-cooldown logic, `train`, `predict` | SGD/Nesterov recipe, EMA/SWA, anytime action queue, no idle safe time, improved prediction reserve, optional refit/TTA |
+| `submission/nas.py` | validation splitting/evaluation, `_expand_promoted_macro_pool`, `_select_label_aware_entries`, refinement checkpoint helpers, `_final_selection_scores`, `_order_final_results`, `_recipe_acceptance_margin`, `_recipe_tournament`, `_successive_halving`, `_search_pipeline`, time-tier configuration | Prior-preserving holdouts, full promoted-family capacity coverage, best refinement restoration, confirmation-dominant selection, uncertainty-aware incumbent replacement, scalable budgets, retained tied challenger |
+| `submission/trainer.py` | recipe application, optimizer/scheduler construction, `_step_scheduler`, `_apply_time_cooldown`, `_attempt_rotation_reason`, `_select_alternative_recipe`, `train`, `predict` | SGD/Nesterov, monotonic no-restart cosine, failed-attempt and late-plateau rotation, regularized fallback, EMA/checkpoint averaging, anytime action queue, measured prediction reserve, optional refit/TTA |
 | `submission/data_processor.py` | `NASDataset`, normalization statistics, augmentation construction, DataLoader construction | Lazy/per-batch dtype conversion, streaming byte-bounded statistics, searchable augmentation policies, safer large-data loading |
 | `submission/helpers.py` | `inspect_data_properties`, batch-size helper, possible new memory/time helpers | Richer axis/modality fingerprints, memory estimates, train-validation shift statistics |
 | `submission/search_space.py` | `ArchSpec`, blocks, model builders, analytical parameter counts | Token/embedding sequence, channel-independent, volumetric/temporal, position-sensitive, hybrid, WideResNet/ResNeXt/DenseNet-lite families |
@@ -982,13 +1087,13 @@ remains an empirical follow-up rather than enabled competition behavior.
 | `submission/ensemble.py` | currently inactive | Optional only after rule confirmation; otherwise leave unused |
 | `submission/NAS_ARCHITECTURE.md` | active-controller section, pipeline, family and trainer descriptions | Must be updated in the same change as any implementation modification |
 | `submission/README.md` | runtime modes and feature summary | Update after behavior changes |
-| `test_controller_refinements.py` | controller unit/regression tests | Incumbent preservation, staged recipe promotion, time-budget behavior, tied finalists |
+| `test_controller_refinements.py` | controller unit/regression tests | Incumbent preservation, staged recipe promotion, uncertainty margins, best refinement restore, confirmation dominance, rank-only ties, promoted-family capacity coverage |
 | `test_architecture_fixes.py` | search-space tests | New family activation, shapes, parameter counts, forward compatibility |
 | `test_data_processor.py` | data-processing tests | No full dtype copy, streaming stats, byte caps, augmentation policy behavior |
 | `test_full_pipeline.py` | end-to-end synthetic tiers | Full prediction count, short-budget fallbacks, no idle/crash behavior |
 | `test_memory_safety.py` | implemented | Large synthetic shapes/dtypes, cache-byte ceilings, logical microbatches |
 | `test_search_objective.py` | implemented | Prior-preserving validation, confirmation, confidence, loss/gap promotion |
-| `test_trainer_anytime.py` | implemented | SGD/cosine, TTA, dormant challenger, clock-driven training |
+| `test_trainer_anytime.py` | implemented | SGD/no-restart cosine, attempt-rotation guards, regularized priority, TTA, dormant challenger, clock-driven training |
 | `test_accelerated_pipeline.py` | implemented | Fast Tier-1 processing/search/training/prediction integration |
 
 Files that must **not** be modified for a submission:
@@ -1006,9 +1111,14 @@ not bundle evaluation files, test data, or hidden-dataset logic.
 | Change | Expected benefit | Main risk | Rule/safety constraint |
 |---|---|---|---|
 | Prior-preserving, split validation | More accurate model selection; less overfitting | Smaller selection subsets can be noisy | Never inspect test labels |
-| Incumbent-safe staged recipe race | Fixes an observed 2/3 recipe-selection failure | Uses more early time | Must preserve prediction reserve |
+| Incumbent-safe staged recipe race with uncertainty margin | Fixes an observed 2/3 recipe-selection failure and rejects marginal replacement | May preserve an actually better recipe on a noisy/small holdout | Must preserve prediction reserve and use training labels only |
+| Best refinement restoration | Prevents later search updates from erasing a better finalist | Extra CPU checkpoint memory | Optimizer and data-cursor state must match restored weights |
+| Confirmation-dominant final selection | Prevents adaptive history from overriding independent evidence | Small confirmation subsets can reorder true near-ties | Historical rank is permitted only inside the bounded tie band |
+| Full promoted-family size coverage | Recovers compact-to-wide capacity options | A weak size stratum consumes one finalist slot | Fixed label-candidate count and parameter/memory guards remain active |
 | Minimum meaningful architecture fidelity | Lower selection regret | Fewer candidates evaluated | Remain dataset-agnostic |
 | Scalable anytime controller | Uses otherwise wasted compute and long Phase 3 budgets | More validation adaptivity | Hard external clock checks remain mandatory |
+| Guarded attempt rotation | Redirects time from failed/overfit attempts | A very slow recovery may be interrupted | Immutable global best and minimum-runway conditions remain active |
+| Monotonic no-restart cosine | Avoids late destructive LR rebound | May remove a useful restart on rare tasks | No new clock, data, or test-label dependency |
 | Lazy conversion and byte caps | Prevents RAM failure and `-10` | Per-batch CPU overhead | Full test ordering and coverage must remain unchanged |
 | New semantic families | Large upside on obscure data | Search dilution and code complexity | Activate from data/labels, never codename |
 | SGD/EMA/SWA | Better generalization and stable checkpoints | Additional state and tuning | Return one valid PyTorch model |
@@ -1205,57 +1315,69 @@ Recommended ablation order:
 
 A new session should not have to rediscover the following:
 
-1. **The current code is more authoritative than old prose.** The first
-   "active controller" section of `submission/NAS_ARCHITECTURE.md` overrides
-   historical sections later in that file.
-2. **The latest run used the evaluator's 30-minute default** because the three
+1. **The active architecture description and current code are authoritative.**
+   Use the first "active controller" section of
+   `submission/NAS_ARCHITECTURE.md`; later historical material is retained only
+   to explain how the design evolved.
+2. **The latest successful pre-correction score is 4.233 adjusted points:**
+   AddNIST `+3.379` at 93.280%, Gutenberg `+0.164` at 41.950%, and Language
+   `+0.689` at 86.220%. The older 5.135 result is a separate historical
+   baseline, not the current result.
+3. **Those runs used the evaluator's 30-minute default** because all three
    metadata files lacked `time_limit`.
-3. **The current total adjusted score is 5.135:** AddNIST `+4.177`,
-   Gutenberg `+1.133`, Language `-0.176`.
-4. **The recipe tournament was reliable on only one of three tasks.**
-   Gutenberg eventually preferred `fast_fit`, and Language eventually
-   preferred `regularized`, despite different one-stage tournament winners.
-5. **Language entered Trainer below its pre-tournament architecture
-   checkpoint:** 84.00% before the tournament versus an 82.89% trainer
-   baseline.
-6. **Early architecture accuracy is not reliable at the current fidelity.**
-   The AddNIST winner moved from 7.69% in round 1 to 93.84% final validation.
-7. **The controller left substantial time unused:** about 749 seconds on
-   Gutenberg and 516 seconds on Language.
-8. **All three proxy top-three lists were factorized, but no final winner was
-   factorized.** Family quotas are useful; additional proxy weight is not
-   currently justified.
-9. **Gutenberg's final architecture comparison was an effective tie:**
-   38.31% versus 38.28%. The current selector has no uncertainty model.
-10. **The current search validation sample changes class priors.** This has not
-    yet failed visibly because the three logged datasets were balanced.
-11. **All final recipes use AdamW.** Optimizer diversity is currently absent.
-12. **The architecture portfolio handles sparse one-hot axes better than
-    continuous embedding sequences, channel-independent views, volume, time,
-    or exact board position.**
-13. **Historical four-dimensional tensors can be semantically non-image.**
-    Shape alone is not a safe routing signal.
-14. **Large-input memory safety is unproven.** The latest inputs were only
-    24-28 pixels per side. Normalization and validation caching still have
-    large temporary-allocation risks.
-15. **The default `C:\Python314` environment has neither PyTorch nor pytest.**
-    `C:\Users\Lennart\miniconda3\python.exe` does contain CPU PyTorch and was
-    used to run the repository's executable regression scripts. CUDA and
-    historical-dataset accuracy validation still require Colab or the
-    competition-compatible environment.
-16. **Do not tune against codenames.** `Adaline` is AddNIST and `LaMelo` is
-    Language in the log, but implementation decisions must remain based on
-    tensor content, labels, measured learning, memory, and time.
-17. **Do not modify `evaluation/main.py` or `evaluation/score.py`.** They are
-    organizer-controlled and overwritten during evaluation.
-18. **The existing `submission/ensemble.py` is inactive.** Ensembling is not
-    required by this plan and should not be enabled without organizer
-    confirmation.
-19. **The first implementation step is complete.** `submission/nas.py` now
-    contains the incumbent-safe staged recipe race, with regression coverage
-    in `test_controller_refinements.py`. No independent architecture,
-    augmentation, or Trainer change was included.
-20. **Before any future edit, recheck `git status` and preserve unrelated user
+4. **The three-dataset failure log used the wrong runtime.** It is not evidence
+   that the submission was broken. Device-safe evaluation, OOM splitting, and
+   malformed-family containment remain worthwhile defensive invariants.
+5. **The latest successful run returned worse refinement endpoints for several
+   finalists.** Current code restores the best matching model, optimizer,
+   step, and data-cursor state before holdout comparison.
+6. **Historical rank selected the clearly worse AddNIST finalist.** Current
+   code makes confirmation accuracy dominant; loss, combined holdout score,
+   and rank can act only inside a bounded confirmation uncertainty band.
+7. **A 0.20-point Gutenberg recipe gain was too small to trust.** Recipe
+   replacement now must clear an accuracy-dependent uncertainty margin on both
+   selection and confirmation; the unchanged architecture checkpoint remains
+   the incumbent.
+8. **Capacity coverage, not more proxy weight, is the appropriate proxy fix.**
+   Current code restores the full feasible macro pool for promoted families,
+   uses compact-to-wide parameter strata, and includes a C64 anchor for
+   full-grid families.
+9. **Final-training allocation was pathological on the latest run.** Current
+   code distinguishes a failed overfit recovery from a productive slow
+   recovery, rotates the former early, and rotates the latter only after a
+   guarded late plateau.
+10. **Cosine SGD must not restart accidentally.** Its scheduler now freezes at
+    `T_max`, and time-based cooldown is clamped so LR cannot increase.
+11. **The controller is now prior-preserving and uncertainty-aware.** Search
+    selection and confirmation are deterministic disjoint splits, and
+    ordinary accuracy remains distinct from balanced-accuracy diagnostics.
+12. **Optimizer and representation diversity are already implemented.**
+    AdamW and zero-smoothing SGD/Nesterov are active; categorical and dense
+    sequences, channel-independent views, volume/time, coordinate-sensitive,
+    grouped/wide, and dense-reuse families are in the portfolio.
+13. **Shape alone is still not a semantic routing signal.** Historical
+    four-dimensional tensors can be non-image, so activation must remain based
+    on content statistics and measured label-aware learning.
+14. **Local memory regression coverage exists, but real CUDA behavior is still
+    unproven after the correction.** The latest inputs were only 24-28 pixels
+    per side; run a competition-compatible CUDA/OOM stress test before
+    submission.
+15. **No post-correction accuracy claim is justified yet.** The next empirical
+    task is a paired, multi-seed rerun on the original three and broader
+    historical datasets, recording raw accuracy, selection regret, runtime,
+    peak memory, and failure rate.
+16. **The default `C:\Python314` environment lacks PyTorch and pytest.**
+    `C:\Users\Lennart\miniconda3\python.exe` contains CPU PyTorch and runs the
+    executable regression scripts; CUDA and historical arrays require Colab or
+    the competition-compatible environment.
+17. **Do not tune against codenames or touch organizer files.** `Adaline` is
+    AddNIST and `LaMelo` is Language in the log, but decisions must depend only
+    on allowed tensor, label, learning, memory, and clock measurements.
+    `evaluation/main.py` and `evaluation/score.py` are organizer-controlled.
+18. **Refit and ensembling remain deliberately disabled.** Enable
+    train-plus-validation refit only after broad leave-one-dataset-out evidence,
+    and do not enable `submission/ensemble.py` without organizer confirmation.
+19. **Before any future edit, recheck `git status` and preserve unrelated user
     changes.**
 
 ## 12. Reference links

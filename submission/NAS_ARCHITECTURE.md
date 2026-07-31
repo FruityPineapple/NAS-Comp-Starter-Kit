@@ -1,6 +1,6 @@
 # NAS Architecture
 
-Status: 30 July 2026
+Status: 31 July 2026
 
 This document describes the active competition implementation. The code is
 authoritative if a future change makes this document stale.
@@ -141,7 +141,8 @@ remaining-time deadline.
 SynFlow, Jacobian correlation, NASWOT, and measured proxy latency only order
 or reduce the initial pool. Proxy values do not enter later label-based
 utility. Deterministic family anchors are considered first, and sampling spans
-family and parameter-size strata.
+family and parameter-size strata. The generic full-grid families include a
+genuinely wide C64 anchor when it survives the parameter guard.
 
 ### 6.3 Representation probe race
 
@@ -154,6 +155,12 @@ a second equal segment on new data positions.
 
 Only macro candidates from promoted families enter successive halving. If the
 clock or evidence is insufficient, all represented families remain eligible.
+After promotion, the controller restores every feasible specification from
+the promoted families before selecting macro finalists. Deterministic
+log-parameter quantiles provide compact, medium, and high-capacity coverage;
+proxy rank breaks only same-size ties. The number of label-trained finalists
+does not increase.
+
 Every controller evaluation first places its model on the controller device;
 this includes newly constructed probes and probes parked on CPU between
 stages. A runtime-invalid family is skipped locally. If fewer than two probes
@@ -171,12 +178,17 @@ gradients.
 Successive-halving survivors retain optimizer state and use a progressive data
 cursor instead of replaying the start of a cache. Finalists then receive equal
 deterministic full-data passes while they still improve and the recipe reserve
-is safe.
+is safe. Each finalist keeps its best evaluated model state together with the
+matching optimizer state, step count, and data cursor. That state is restored
+before final selection, so a later partial or degrading pass cannot erase a
+stronger refinement checkpoint.
 
-The last architectures are compared on both validation splits. Confirmation
-accuracy receives 80% of the robust score; selection accuracy and earlier rank
-stability are smaller terms. When confirmation accuracies overlap within a
-bounded sampling interval, confirmation loss resolves the tie.
+The last architectures are compared on both validation splits. A candidate
+that clearly wins confirmation accuracy cannot be overturned by adaptive
+history. When confirmation accuracies overlap within a bounded sampling
+interval, confirmation loss resolves the tie, followed by the combined
+selection/confirmation score and finally historical rank. Historical rank is
+therefore strictly a tie-break rather than an additive accuracy surrogate.
 
 The runner-up specification is always recorded. Its CPU checkpoint is retained
 only for a statistical tie. It is stored in a dormant plain Python bundle, so
@@ -205,10 +217,13 @@ two receive equal stage-two work. Promotion uses best accuracy plus bounded
 loss slope and train/validation-gap terms. Each trial restores its best
 evaluated stage and matching optimizer state.
 
-A trial must improve selection accuracy by at least
-`max(0.001, 1/N_selection)` and independently improve confirmation accuracy by
-its sampling margin. Otherwise the unchanged architecture incumbent and its
-optimizer state are returned.
+A trial must improve both selection and confirmation accuracy by at least:
+
+`max(0.001, 1/N, min(0.01, 0.75 * pooled_standard_error))`
+
+The margin is recomputed for each incumbent/challenger comparison. Otherwise
+the unchanged architecture incumbent and its matching optimizer state are
+returned.
 
 ## 8. Final anytime trainer
 
@@ -222,8 +237,10 @@ The hard epoch ceiling is 100,000 and exists only as protection against a
 broken synthetic clock; the supplied competition clock is the normal stop.
 
 AdamW recipes use validation-driven `ReduceLROnPlateau`. SGD uses Nesterov and
-cosine decay. Both paths use warmup, AMP on CUDA, gradient clipping, and a
-monotonic wall-clock cooldown ceiling.
+a single monotonic cosine decay. Once the initial cosine horizon is exhausted,
+the LR remains at its floor; exceeding an early epoch estimate cannot create
+an accidental warm restart. Both paths use warmup, AMP on CUDA, gradient
+clipping, and a monotonic wall-clock cooldown ceiling.
 
 The ordered anytime queue is:
 
@@ -235,6 +252,14 @@ The ordered anytime queue is:
    learning rates and fresh seeds while another full epoch is safe;
 5. evaluate the current attempt's EMA and the top three same-architecture
    checkpoint average if a complete validation pass still fits.
+
+An attempt can rotate before reaching its LR floor when it has received a
+minimum runway, remains materially below the immutable starting checkpoint,
+has stopped improving, and has developed a large train/validation gap. An
+attempt that already improved the checkpoint receives a much longer runway
+and rotates only after a long plateau at a substantially decayed LR. A large
+gap prioritizes the regularized alternative. These conditions are based only
+on validation behavior and resource measurements.
 
 The global best validation checkpoint never regresses. If a different
 architecture wins, Trainer returns it and updates the model used by
@@ -278,9 +303,12 @@ The current regression suite covers:
 - source-dtype preservation, streaming statistics, train/validation byte caps,
   disjoint prior-preserving confirmation, and logical microbatch accumulation;
 - incumbent preservation, staged recipe fairness, loss/gap/confirmation
-  objectives, and optimizer-state ownership;
-- SGD/Nesterov/cosine construction, incompatible-state rejection, EMA/state
-  helpers, safe-flip TTA, and dormant challenger registration;
+  objectives, uncertainty-aware acceptance, best-refinement restoration,
+  holdout-dominant ordering, promoted-family capacity strata, and
+  optimizer-state ownership;
+- SGD/Nesterov/cosine construction, no-rebound scheduling,
+  incumbent-relative attempt rotation, incompatible-state rejection,
+  EMA/state helpers, safe-flip TTA, and dormant challenger registration;
 - an accelerated Tier-1 end-to-end flow through processing, NAS, anytime
   training, and complete ordered prediction.
 

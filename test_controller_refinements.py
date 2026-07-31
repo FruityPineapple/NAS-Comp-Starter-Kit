@@ -277,7 +277,47 @@ def test_architectures_are_not_confounded_with_recipes():
         assert set(names) == {"architecture_probe"}
 
 
-def test_final_score_rewards_accuracy_and_rank_stability():
+def test_promoted_pool_restores_high_capacity_size_strata():
+    controller = object.__new__(NAS)
+    controller.metadata = {}
+    controller.input_h = 27
+    controller.input_w = 18
+    small = ArchSpec(2, 16, 1, "basic", 3, False, 3, "spatial")
+    medium = ArchSpec(2, 32, 2, "basic", 3, False, 3, "spatial")
+    wide = ArchSpec(2, 64, 2, "basic", 3, False, 3, "spatial")
+    largest = ArchSpec(3, 64, 3, "basic", 3, False, 3, "spatial")
+    ranked = [
+        {
+            "spec": small,
+            "params": 20_000,
+            "proxy_prior": 1.0,
+        },
+        {
+            "spec": medium,
+            "params": 80_000,
+            "proxy_prior": 0.8,
+        },
+    ]
+    pool = [
+        (small, 20_000),
+        (medium, 80_000),
+        (wide, 320_000),
+        (largest, 1_200_000),
+    ]
+    expanded = controller._expand_promoted_macro_pool(
+        ranked, pool, {"spatial"}
+    )
+    selected = controller._select_label_aware_entries(expanded, 3)
+    assert len(expanded) == 4
+    assert any(entry["spec"].init_channels == 64 for entry in selected)
+    assert max(entry["params"] for entry in selected) == 1_200_000
+    anchors = controller._anchor_specs(
+        "spatial", SimpleNamespace(max_safe_stages=4)
+    )
+    assert any(spec.init_channels == 64 for spec in anchors)
+
+
+def test_final_score_does_not_let_rank_override_final_accuracy():
     controller = object.__new__(NAS)
     stable = {
         "full_val_acc": 0.82,
@@ -288,7 +328,105 @@ def test_final_score_rewards_accuracy_and_rank_stability():
         "val_history": [0.40, 0.55, 0.79],
     }
     entries = controller._final_selection_scores([stable, late_flip])
-    assert entries[0]["selection_score"] > entries[1]["selection_score"]
+    assert entries[1]["selection_score"] > entries[0]["selection_score"]
+    assert (
+        entries[0]["history_rank_score"]
+        > entries[1]["history_rank_score"]
+    )
+
+
+def test_clear_confirmation_winner_cannot_be_overturned_by_history():
+    controller = object.__new__(NAS)
+    historical_leader = {
+        "selection_val_acc": 0.7214,
+        "confirmation_val_acc": 0.7126,
+        "confirmation_val_loss": 0.90,
+        "confirmation_samples": 1023,
+        "val_history": [0.50, 0.65, 0.755, 0.7214],
+    }
+    holdout_winner = {
+        "selection_val_acc": 0.7494,
+        "confirmation_val_acc": 0.7468,
+        "confirmation_val_loss": 0.80,
+        "confirmation_samples": 1023,
+        "val_history": [0.40, 0.55, 0.7185, 0.7494],
+    }
+    ordered, tie_threshold = controller._order_final_results(
+        [historical_leader, holdout_winner]
+    )
+    assert ordered[0] is holdout_winner
+    assert tie_threshold is None
+
+
+def test_rank_history_is_only_a_confirmation_tie_break():
+    controller = object.__new__(NAS)
+    stable = {
+        "selection_val_acc": 0.80,
+        "confirmation_val_acc": 0.75,
+        "confirmation_val_loss": 0.70,
+        "confirmation_samples": 1000,
+        "val_history": [0.65, 0.72, 0.80],
+    }
+    late = {
+        "selection_val_acc": 0.80,
+        "confirmation_val_acc": 0.75,
+        "confirmation_val_loss": 0.70,
+        "confirmation_samples": 1000,
+        "val_history": [0.45, 0.60, 0.80],
+    }
+    ordered, tie_threshold = controller._order_final_results(
+        [late, stable]
+    )
+    assert tie_threshold is not None
+    assert ordered[0] is stable
+
+
+def test_refinement_checkpoint_restores_weights_and_optimizer():
+    controller = object.__new__(NAS)
+    model = _TinyRecipeModel()
+    with torch.no_grad():
+        model.marker.fill_(3.0)
+    candidate = {
+        "model": model,
+        "optimizer_state": {
+            "state": {},
+            "param_groups": [{"marker": 3.0}],
+        },
+        "val_acc": 0.80,
+        "balanced_acc": 0.79,
+        "val_loss": 0.60,
+        "val_margin": 0.30,
+        "val_samples": 100,
+        "trained_steps": 30,
+        "data_cursor": 30,
+        "train_stats": {"train_accuracy": 0.90},
+    }
+    checkpoint = controller._snapshot_refinement_checkpoint(candidate)
+    with torch.no_grad():
+        model.marker.fill_(7.0)
+    candidate.update(
+        {
+            "optimizer_state": {
+                "state": {},
+                "param_groups": [{"marker": 7.0}],
+            },
+            "val_acc": 0.70,
+            "val_loss": 0.90,
+            "trained_steps": 70,
+            "data_cursor": 70,
+        }
+    )
+    assert not controller._is_better_refinement_checkpoint(
+        candidate, checkpoint
+    )
+    controller._restore_refinement_checkpoint(candidate, checkpoint)
+    assert abs(model.marker.item() - 3.0) < 1e-12
+    assert candidate["val_acc"] == 0.80
+    assert candidate["trained_steps"] == 30
+    assert (
+        candidate["optimizer_state"]["param_groups"][0]["marker"]
+        == 3.0
+    )
 
 
 def test_search_plateau_keeps_state_and_reduces_lr():
@@ -369,6 +507,21 @@ def test_recipe_race_restores_best_stage_and_matching_optimizer():
     stage_two = [call for call in calls if call["stage"] == 2]
     assert {call["start_marker"] for call in stage_two} == {2.0, 3.0}
     assert {call["optimizer_marker"] for call in stage_two} == {2.0, 3.0}
+
+
+def test_recipe_race_rejects_a_gain_inside_sampling_uncertainty():
+    result, _, _, _ = _run_recipe_race(
+        {
+            "stable": [(2, 0.842, 0.68), (5, 0.842, 0.67)],
+            "regularized": [(3, 0.841, 0.69), (6, 0.841, 0.68)],
+            "fast_fit": [(4, 0.800, 0.75)],
+        },
+        incumbent_accuracy=0.840,
+        samples=1_000,
+    )
+    assert result["recipe"]["name"] == "stable"
+    assert abs(result["model"].marker.item() - 1.0) < 1e-12
+    assert abs(result["val_acc"] - 0.840) < 1e-12
 
 
 def test_recipe_trial_score_uses_validation_loss_slope():
@@ -487,10 +640,15 @@ def test_recipe_race_short_budget_falls_back_without_training():
 if __name__ == "__main__":
     test_label_aware_slots_are_family_balanced()
     test_architectures_are_not_confounded_with_recipes()
-    test_final_score_rewards_accuracy_and_rank_stability()
+    test_promoted_pool_restores_high_capacity_size_strata()
+    test_final_score_does_not_let_rank_override_final_accuracy()
+    test_clear_confirmation_winner_cannot_be_overturned_by_history()
+    test_rank_history_is_only_a_confirmation_tie_break()
+    test_refinement_checkpoint_restores_weights_and_optimizer()
     test_search_plateau_keeps_state_and_reduces_lr()
     test_recipe_race_preserves_a_stronger_incumbent()
     test_recipe_race_restores_best_stage_and_matching_optimizer()
+    test_recipe_race_rejects_a_gain_inside_sampling_uncertainty()
     test_recipe_trial_score_uses_validation_loss_slope()
     test_controller_evaluation_reports_cross_entropy_loss()
     test_controller_evaluation_places_fresh_model_on_controller_device()
